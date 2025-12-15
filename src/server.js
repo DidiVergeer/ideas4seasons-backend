@@ -17,6 +17,27 @@ const pool = new Pool({
 });
 
 // =======================
+// AUTH MIDDLEWARE
+// =======================
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return res.status(401).json({ error: "No token provided" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+// =======================
 // Health check
 // =======================
 app.get("/health", (req, res) => {
@@ -56,7 +77,6 @@ app.post("/admin/setup", async (req, res) => {
   }
 
   try {
-    // agents table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS agents (
         id SERIAL PRIMARY KEY,
@@ -66,10 +86,8 @@ app.post("/admin/setup", async (req, res) => {
       )
     `);
 
-    // hash pin
     const pinHash = await bcrypt.hash(pin, 10);
 
-    // insert agent
     await pool.query(
       `
       INSERT INTO agents (agent_id, pin_hash)
@@ -130,6 +148,16 @@ app.post("/auth/login", async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "login failed" });
   }
+});
+
+// =======================
+// ME (protected route)
+// =======================
+app.get("/me", authMiddleware, (req, res) => {
+  res.json({
+    status: "ok",
+    user: req.user,
+  });
 });
 
 // =======================
