@@ -4,22 +4,32 @@ const { Pool } = require("pg");
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-
+// Database
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
 });
 
-app.get("/health", async (req, res) => {
+// Health check (geen database)
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    time: new Date().toISOString(),
+  });
+});
+
+// Database test
+app.get("/db-test", async (req, res) => {
   try {
-    await pool.query("select 1");
-    res.json({ ok: true });
+    await pool.query("SELECT 1");
+    res.json({ db: "connected" });
   } catch (err) {
-    res.status(500).json({ ok: false });
+    console.error(err);
+    res.status(500).json({ db: "error" });
   }
 });
 
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`API running on port ${PORT}`);
 });
