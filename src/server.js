@@ -1,24 +1,40 @@
 const express = require("express");
+const cors = require("cors");
 const { Pool } = require("pg");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 
 const app = express();
+
+/* =======================
+   CORS (BELANGRIJK)
+   ======================= */
+app.use(
+  cors({
+    origin: [
+      "http://localhost:3000", // frontend lokaal
+      "https://ideas4seasons-frontend.onrender.com", // straks productie
+    ],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// =======================
-// Database
-// =======================
+/* =======================
+   Database
+   ======================= */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// =======================
-// AUTH MIDDLEWARE
-// =======================
+/* =======================
+   AUTH MIDDLEWARE
+   ======================= */
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
 
@@ -37,9 +53,9 @@ function authMiddleware(req, res, next) {
   }
 }
 
-// =======================
-// Health check
-// =======================
+/* =======================
+   Health check
+   ======================= */
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -47,9 +63,9 @@ app.get("/health", (req, res) => {
   });
 });
 
-// =======================
-// DB test
-// =======================
+/* =======================
+   DB test
+   ======================= */
 app.get("/db-test", async (req, res) => {
   try {
     await pool.query("SELECT 1");
@@ -60,9 +76,9 @@ app.get("/db-test", async (req, res) => {
   }
 });
 
-// =======================
-// ADMIN SETUP (1x)
-// =======================
+/* =======================
+   ADMIN SETUP (1x)
+   ======================= */
 app.post("/admin/setup", async (req, res) => {
   const setupKey = req.query.key;
 
@@ -107,9 +123,9 @@ app.post("/admin/setup", async (req, res) => {
   }
 });
 
-// =======================
-// AUTH LOGIN
-// =======================
+/* =======================
+   AUTH LOGIN
+   ======================= */
 app.post("/auth/login", async (req, res) => {
   const { agentId, pin } = req.body;
 
@@ -150,9 +166,9 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-// =======================
-// ME (protected route)
-// =======================
+/* =======================
+   ME (protected)
+   ======================= */
 app.get("/me", authMiddleware, (req, res) => {
   res.json({
     status: "ok",
@@ -160,7 +176,9 @@ app.get("/me", authMiddleware, (req, res) => {
   });
 });
 
-// =======================
+/* =======================
+   START SERVER
+   ======================= */
 app.listen(PORT, () => {
   console.log(`API running on port ${PORT}`);
 });
