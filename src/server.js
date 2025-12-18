@@ -164,6 +164,97 @@ app.post("/db/setup-products", async (req, res) => {
 });
 
 /* =======================
+   SYNC PRODUCTS (A2)
+   ======================= */
+app.post("/sync/products", async (req, res) => {
+  // beveiliging met dezelfde setup key als admin/setup
+  const key = req.query.key;
+  if (!key || key !== process.env.SETUP_KEY) {
+    return res.status(401).json({ ok: false, error: "Invalid setup key" });
+  }
+
+  const connectorId = process.env.AFAS_CONNECTOR; // Items_Core
+  const take = Number(req.query.take || 100);
+
+  let skip = 0;
+  let pages = 0;
+  let totalUpserted = 0;
+
+  try {
+    while (true) {
+      const data = await fetchAfas(connectorId, { skip, take });
+      const rows = data?.rows || [];
+
+      if (rows.length === 0) break;
+
+      for (const r of rows) {
+        // itemcode is leidend
+        const itemcode = r.Itemcode ?? null;
+        if (!itemcode) continue;
+
+        await pool.query(
+          `
+          INSERT INTO products (
+            itemcode,
+            type_item,
+            description_eng,
+            unit,
+            price,
+            outercarton,
+            innercarton,
+            ean,
+            available_stock,
+            ecommerce_available,
+            raw,
+            updated_at
+          ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW()
+          )
+          ON CONFLICT (itemcode) DO UPDATE SET
+            type_item = EXCLUDED.type_item,
+            description_eng = EXCLUDED.description_eng,
+            unit = EXCLUDED.unit,
+            price = EXCLUDED.price,
+            outercarton = EXCLUDED.outercarton,
+            innercarton = EXCLUDED.innercarton,
+            ean = EXCLUDED.ean,
+            available_stock = EXCLUDED.available_stock,
+            ecommerce_available = EXCLUDED.ecommerce_available,
+            raw = EXCLUDED.raw,
+            updated_at = NOW()
+          `,
+          [
+            itemcode,
+            r.Type_item ?? null,
+            r.OMSCHRIJVING_ENG ?? null,
+            r.UNIT ?? null,
+            r.Prijs ?? null,
+            r.OUTERCARTON ?? null,
+            r.INNERCARTON ?? null,
+            r["EAN_product__Opgeschoonde_barcode_"] ?? null,
+            r.Beschikbare_voorraad ?? null,
+            r["E-commerce_beschikbaar"] ?? null,
+            r, // raw JSONB
+          ]
+        );
+
+        totalUpserted += 1;
+      }
+
+      pages += 1;
+      skip += rows.length;
+
+      if (rows.length < take) break;
+    }
+
+    res.json({ ok: true, pages, upserted: totalUpserted });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+/* =======================
    ADMIN SETUP (1x)
    ======================= */
 app.post("/admin/setup", async (req, res) => {
