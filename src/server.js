@@ -13,7 +13,7 @@ app.use(
   cors({
     origin: [
       "http://localhost:3000", // frontend lokaal
-      "https://ideas4seasons-frontend.onrender.com", // straks productie
+      "https://ideas4seasons-frontend.onrender.com", // productie
     ],
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -68,7 +68,9 @@ async function fetchAfas(connectorId, { skip = 0, take = 1 } = {}) {
   const dataToken = process.env.AFAS_TOKEN_DATA; // 60-tekens data string
 
   if (!env || !dataToken || !connectorId) {
-    throw new Error("Missing AFAS env vars (AFAS_ENV / AFAS_TOKEN_DATA / AFAS_CONNECTOR)");
+    throw new Error(
+      "Missing AFAS env vars (AFAS_ENV / AFAS_TOKEN_DATA / AFAS_CONNECTOR)"
+    );
   }
 
   const url = `https://${env}.rest.afas.online/ProfitRestServices/connectors/${connectorId}?skip=${skip}&take=${take}`;
@@ -98,7 +100,7 @@ app.get("/health", (req, res) => {
 });
 
 /* =======================
-   AFAS health check (nieuw)
+   AFAS health check
    ======================= */
 app.get("/health/afas", async (req, res) => {
   try {
@@ -129,6 +131,35 @@ app.get("/db-test", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ db: "error" });
+  }
+});
+
+/* =======================
+   PRODUCTS TABLE SETUP (A1)
+   ======================= */
+app.post("/db/setup-products", async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS products (
+        itemcode TEXT PRIMARY KEY,
+        type_item TEXT NULL,
+        description_eng TEXT NULL,
+        unit TEXT NULL,
+        price NUMERIC NULL,
+        outercarton TEXT NULL,
+        innercarton TEXT NULL,
+        ean TEXT NULL,
+        available_stock NUMERIC NULL,
+        ecommerce_available BOOLEAN NULL,
+        raw JSONB NULL,
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    res.json({ ok: true, message: "products table ready" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -206,11 +237,9 @@ app.post("/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const token = jwt.sign(
-      { agentId: agent.agent_id },
-      process.env.JWT_SECRET,
-      { expiresIn: "8h" }
-    );
+    const token = jwt.sign({ agentId: agent.agent_id }, process.env.JWT_SECRET, {
+      expiresIn: "8h",
+    });
 
     res.json({
       token,
