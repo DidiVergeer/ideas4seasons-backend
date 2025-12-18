@@ -365,6 +365,16 @@ app.get("/debug/products/count", async (req, res) => {
     res.status(500).json({ error: "db error" });
   }
 });
+app.get("/debug/products/columns", async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT column_name, data_type
+    FROM information_schema.columns
+    WHERE table_name = 'products'
+    ORDER BY ordinal_position
+  `);
+  res.json(rows);
+});
+
 /* =======================
    START SERVER
    ======================= */
