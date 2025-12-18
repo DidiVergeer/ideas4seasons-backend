@@ -351,7 +351,20 @@ app.get("/me", authMiddleware, (req, res) => {
     user: req.user,
   });
 });
-
+/* =====================
+   DEBUG
+   ===================== */
+app.get("/debug/products/count", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT count(*) FROM products"
+    );
+    res.json({ count: Number(result.rows[0].count) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "db error" });
+  }
+});
 /* =======================
    START SERVER
    ======================= */
