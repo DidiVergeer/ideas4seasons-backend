@@ -54,6 +54,40 @@ function authMiddleware(req, res, next) {
 }
 
 /* =======================
+   AFAS HELPERS
+   ======================= */
+function buildAfasAuthHeaderFromData(dataToken) {
+  // AFAS classic token: base64 van XML token wrapper
+  const xmlToken = `<token><version>1</version><data>${dataToken}</data></token>`;
+  const b64 = Buffer.from(xmlToken, "utf8").toString("base64");
+  return `AfasToken ${b64}`;
+}
+
+async function fetchAfas(connectorId, { skip = 0, take = 1 } = {}) {
+  const env = process.env.AFAS_ENV; // "82610"
+  const dataToken = process.env.AFAS_TOKEN_DATA; // 60-tekens data string
+
+  if (!env || !dataToken || !connectorId) {
+    throw new Error("Missing AFAS env vars (AFAS_ENV / AFAS_TOKEN_DATA / AFAS_CONNECTOR)");
+  }
+
+  const url = `https://${env}.rest.afas.online/ProfitRestServices/connectors/${connectorId}?skip=${skip}&take=${take}`;
+
+  const res = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: buildAfasAuthHeaderFromData(dataToken),
+      Accept: "application/json",
+    },
+  });
+
+  const text = await res.text();
+  if (!res.ok) throw new Error(`AFAS ${res.status}: ${text}`);
+
+  return JSON.parse(text);
+}
+
+/* =======================
    Health check
    ======================= */
 app.get("/health", (req, res) => {
@@ -61,6 +95,28 @@ app.get("/health", (req, res) => {
     status: "ok",
     time: new Date().toISOString(),
   });
+});
+
+/* =======================
+   AFAS health check (nieuw)
+   ======================= */
+app.get("/health/afas", async (req, res) => {
+  try {
+    const connectorId = process.env.AFAS_CONNECTOR; // "Items_Core"
+    const data = await fetchAfas(connectorId, { skip: 0, take: 1 });
+
+    res.json({
+      ok: true,
+      env: process.env.AFAS_ENV,
+      connectorId,
+      sample: data?.rows?.[0] ?? null,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err.message || String(err),
+    });
+  }
 });
 
 /* =======================
