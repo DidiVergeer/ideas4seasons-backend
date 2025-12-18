@@ -4,13 +4,17 @@ const { Pool } = require("pg");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 
-// Node 18+ heeft fetch global. Voor zekerheid:
-const fetchFn = typeof fetch !== "undefined" ? fetch : (...args) => import("node-fetch").then(({ default: f }) => f(...args));
+// Node 18+ heeft fetch global. Fallback voor oudere node:
+const fetchFn =
+  typeof fetch !== "undefined"
+    ? fetch
+    : (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
 /* =======================
-   CORS (BELANGRIJK)
+   CORS
    ======================= */
 app.use(
   cors({
@@ -25,10 +29,8 @@ app.use(
 
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-
 /* =======================
-   Database
+   DATABASE
    ======================= */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -64,11 +66,13 @@ function buildAfasAuthHeaderFromData(dataToken) {
 }
 
 async function fetchAfas(connectorId, { skip = 0, take = 100 } = {}) {
-  const env = process.env.AFAS_ENV; // "82610"
-  const dataToken = process.env.AFAS_TOKEN_DATA; // 60-tekens data string
+  const env = process.env.AFAS_ENV;
+  const dataToken = process.env.AFAS_TOKEN_DATA;
 
   if (!env || !dataToken || !connectorId) {
-    throw new Error("Missing AFAS env vars (AFAS_ENV / AFAS_TOKEN_DATA / AFAS_CONNECTOR)");
+    throw new Error(
+      "Missing AFAS env vars (AFAS_ENV / AFAS_TOKEN_DATA / AFAS_CONNECTOR)"
+    );
   }
 
   const url = `https://${env}.rest.afas.online/ProfitRestServices/connectors/${connectorId}?skip=${skip}&take=${take}`;
@@ -88,18 +92,15 @@ async function fetchAfas(connectorId, { skip = 0, take = 100 } = {}) {
 }
 
 /* =======================
-   Health check
+   HEALTH
    ======================= */
 app.get("/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
-/* =======================
-   AFAS health check
-   ======================= */
 app.get("/health/afas", async (req, res) => {
   try {
-    const connectorId = process.env.AFAS_CONNECTOR; // "Items_Core"
+    const connectorId = process.env.AFAS_CONNECTOR;
     const data = await fetchAfas(connectorId, { skip: 0, take: 1 });
 
     res.json({
@@ -113,9 +114,6 @@ app.get("/health/afas", async (req, res) => {
   }
 });
 
-/* =======================
-   DB test
-   ======================= */
 app.get("/db-test", async (req, res) => {
   try {
     await pool.query("SELECT 1");
@@ -127,7 +125,7 @@ app.get("/db-test", async (req, res) => {
 });
 
 /* =======================
-   PRODUCTS TABLE SETUP (A1)
+   DB SETUP (A1)
    ======================= */
 app.post("/db/setup-products", async (req, res) => {
   try {
@@ -146,6 +144,10 @@ app.post("/db/setup-products", async (req, res) => {
         raw JSONB NULL,
         updated_at TIMESTAMP DEFAULT NOW()
       );
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_products_ean ON products(ean);
     `);
 
     res.json({ ok: true, message: "products table ready" });
@@ -175,12 +177,15 @@ app.post("/sync/products", async (req, res) => {
     while (true) {
       const data = await fetchAfas(connectorId, { skip, take });
       const rows = data?.rows || [];
-
       if (rows.length === 0) break;
 
       for (const r of rows) {
         const itemcode = r.Itemcode ?? null;
         if (!itemcode) continue;
+
+        // ✅ FIX: "E-commerce_beschikbaar": "Ja" => boolean
+        const ecomRaw = r["E-commerce_beschikbaar"] ?? null;
+        const ecomBool = ecomRaw === "Ja";
 
         await pool.query(
           `
@@ -223,8 +228,8 @@ app.post("/sync/products", async (req, res) => {
             r.INNERCARTON ?? null,
             r["EAN_product__Opgeschoonde_barcode_"] ?? null,
             r.Beschikbare_voorraad ?? null,
-            r["E-commerce_beschikbaar"] ?? null,
-            r, // raw JSONB
+            ecomBool, // ✅ boolean
+            r,        // raw JSONB
           ]
         );
 
@@ -246,7 +251,7 @@ app.post("/sync/products", async (req, res) => {
 
 /* =======================
    PRODUCTS API (A3)
-   Alleen e-commerce = true tonen
+   Alleen ecommerce_available = true
    ======================= */
 
 // GET /products?limit=50&offset=0
@@ -273,7 +278,7 @@ app.get("/products", async (req, res) => {
   }
 });
 
-// GET /products/:itemcode  (alleen e-commerce = true)
+// GET /products/:itemcode
 app.get("/products/:itemcode", async (req, res) => {
   const { itemcode } = req.params;
 
@@ -299,7 +304,7 @@ app.get("/products/:itemcode", async (req, res) => {
   }
 });
 
-// GET /products/by-ean/:ean (alleen e-commerce = true)
+// GET /products/by-ean/:ean
 app.get("/products/by-ean/:ean", async (req, res) => {
   const { ean } = req.params;
 
@@ -331,13 +336,11 @@ app.get("/products/by-ean/:ean", async (req, res) => {
    ======================= */
 app.post("/admin/setup", async (req, res) => {
   const setupKey = req.query.key;
-
   if (!setupKey || setupKey !== process.env.SETUP_KEY) {
     return res.status(401).json({ error: "Invalid setup key" });
   }
 
   const { agentId, pin } = req.body;
-
   if (!agentId || !pin) {
     return res.status(400).json({ error: "agentId and pin required" });
   }
@@ -381,7 +384,10 @@ app.post("/auth/login", async (req, res) => {
   }
 
   try {
-    const result = await pool.query("SELECT * FROM agents WHERE agent_id = $1", [agentId]);
+    const result = await pool.query(
+      "SELECT * FROM agents WHERE agent_id = $1",
+      [agentId]
+    );
 
     if (result.rows.length === 0) {
       return res.status(401).json({ error: "Invalid credentials" });
@@ -389,14 +395,15 @@ app.post("/auth/login", async (req, res) => {
 
     const agent = result.rows[0];
     const isValid = await bcrypt.compare(pin, agent.pin_hash);
-
     if (!isValid) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const token = jwt.sign({ agentId: agent.agent_id }, process.env.JWT_SECRET, {
-      expiresIn: "8h",
-    });
+    const token = jwt.sign(
+      { agentId: agent.agent_id },
+      process.env.JWT_SECRET,
+      { expiresIn: "8h" }
+    );
 
     res.json({ token, agentId: agent.agent_id });
   } catch (err) {
@@ -412,13 +419,25 @@ app.get("/me", authMiddleware, (req, res) => {
   res.json({ status: "ok", user: req.user });
 });
 
-/* =====================
+/* =======================
    DEBUG
-   ===================== */
+   ======================= */
 app.get("/debug/products/count", async (req, res) => {
   try {
-    const result = await pool.query("SELECT count(*) FROM products");
-    res.json({ count: Number(result.rows[0].count) });
+    const r = await pool.query("SELECT count(*) FROM products");
+    res.json({ count: Number(r.rows[0].count) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "db error" });
+  }
+});
+
+app.get("/debug/products/count-ecom", async (req, res) => {
+  try {
+    const r = await pool.query(
+      "SELECT count(*) FROM products WHERE ecommerce_available = true"
+    );
+    res.json({ count: Number(r.rows[0].count) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "db error" });
