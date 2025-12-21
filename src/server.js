@@ -1,3 +1,5 @@
+// src/server.js
+
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -16,14 +18,35 @@ const PORT = process.env.PORT || 3000;
 /* =======================
    CORS
    ======================= */
+
+// ✅ Sta je dev + render toe
+// ✅ Laat ook "no-origin" toe (native apps / sommige fetches)
+const ALLOWED_ORIGINS = [
+  "http://localhost:3000",
+  "http://localhost:8081",
+  "http://127.0.0.1:8081",
+  "https://ideas4seasons-frontend.onrender.com",
+];
+
 app.use(
   cors({
-    origin: [
-      "http://localhost:3000",
-      "https://ideas4seasons-frontend.onrender.com",
-    ],
+    origin: (origin, cb) => {
+      // Geen origin => meestal native app / server-to-server => toelaten
+      if (!origin) return cb(null, true);
+
+      // Exacte matches
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+
+      // Expo web / LAN dev kan soms variëren: http://192.168.x.x:8081
+      // (optioneel maar handig)
+      if (/^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:8081$/.test(origin))
+        return cb(null, true);
+
+      return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
   })
 );
 
@@ -228,8 +251,8 @@ app.post("/sync/products", async (req, res) => {
             r.INNERCARTON ?? null,
             r["EAN_product__Opgeschoonde_barcode_"] ?? null,
             r.Beschikbare_voorraad ?? null,
-            ecomBool, // ✅ boolean
-            r,        // raw JSONB
+            ecomBool,
+            r,
           ]
         );
 
