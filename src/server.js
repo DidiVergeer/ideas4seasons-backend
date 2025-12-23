@@ -5,6 +5,7 @@ const cors = require("cors");
 const { Pool } = require("pg");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
 
 // Node 18+ heeft fetch global. Fallback voor oudere node:
 const fetchFn =
@@ -50,6 +51,22 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
+
+/* =======================
+   SMALL HELPERS
+   ======================= */
+function requireSetupKey(req, res) {
+  const key = req.query.key;
+  if (!key || key !== process.env.SETUP_KEY) {
+    res.status(401).json({ ok: false, error: "Invalid setup key" });
+    return false;
+  }
+  return true;
+}
+
+function sha1(input) {
+  return crypto.createHash("sha1").update(String(input), "utf8").digest("hex");
+}
 
 /* =======================
    AUTH MIDDLEWARE
@@ -103,12 +120,34 @@ async function fetchAfas(connectorId, { skip = 0, take = 100 } = {}) {
   const text = await res.text();
   if (!res.ok) throw new Error(`AFAS ${res.status}: ${text}`);
 
-  // Soms geeft AFAS lege body bij fouten; hier willen we veilige parse
   try {
     return JSON.parse(text);
   } catch (e) {
     throw new Error(`AFAS invalid JSON: ${text}`);
   }
+}
+
+async function forEachAfasRow(connectorId, { take = 200 } = {}, onRow) {
+  let skip = 0;
+  let pages = 0;
+  let totalRows = 0;
+
+  while (true) {
+    const data = await fetchAfas(connectorId, { skip, take });
+    const rows = data?.rows || [];
+    if (rows.length === 0) break;
+
+    for (const r of rows) {
+      totalRows += 1;
+      await onRow(r);
+    }
+
+    pages += 1;
+    skip += rows.length;
+    if (rows.length < take) break;
+  }
+
+  return { pages, totalRows };
 }
 
 /* =======================
@@ -118,12 +157,10 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
-// bestaande health/afas (blijft)
 app.get("/health/afas", async (req, res) => {
   try {
     const connectorId = process.env.AFAS_CONNECTOR;
     const data = await fetchAfas(connectorId, { skip: 0, take: 1 });
-
     res.json({
       ok: true,
       env: process.env.AFAS_ENV,
@@ -135,12 +172,11 @@ app.get("/health/afas", async (req, res) => {
   }
 });
 
-// ✅ NIEUW: test elke connector direct via backend (geen PowerShell tokens nodig)
+// Test elke connector via backend (handig!)
 app.get("/health/afas/:connectorId", async (req, res) => {
   try {
     const connectorId = req.params.connectorId;
     const data = await fetchAfas(connectorId, { skip: 0, take: 3 });
-
     res.json({
       ok: true,
       env: process.env.AFAS_ENV,
@@ -167,6 +203,8 @@ app.get("/db-test", async (req, res) => {
    DB SETUP (A1)
    ======================= */
 app.post("/db/setup-products", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS products (
@@ -196,34 +234,83 @@ app.post("/db/setup-products", async (req, res) => {
   }
 });
 
+// ✅ Extra tabellen voor Category/Descriptions/Pictures/Stock
+app.post("/db/setup-afas-extra", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS product_categories (
+        itemcode TEXT NOT NULL,
+        category_code TEXT NOT NULL,
+        category_name TEXT NULL,
+        raw JSONB NULL,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (itemcode, category_code)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS product_descriptions (
+        itemcode TEXT NOT NULL,
+        lang TEXT NOT NULL,
+        description TEXT NULL,
+        raw JSONB NULL,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (itemcode, lang)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS product_pictures (
+        itemcode TEXT NOT NULL,
+        picture_id TEXT NOT NULL,
+        url TEXT NULL,
+        sort_order INT NULL,
+        raw JSONB NULL,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (itemcode, picture_id)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS product_stock (
+        itemcode TEXT NOT NULL,
+        warehouse TEXT NOT NULL,
+        available_stock NUMERIC NULL,
+        raw JSONB NULL,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (itemcode, warehouse)
+      );
+    `);
+
+    res.json({ ok: true, message: "extra AFAS tables ready" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 /* =======================
    SYNC PRODUCTS (A2)
    ======================= */
 app.post("/sync/products", async (req, res) => {
-  const key = req.query.key;
-  if (!key || key !== process.env.SETUP_KEY) {
-    return res.status(401).json({ ok: false, error: "Invalid setup key" });
-  }
+  if (!requireSetupKey(req, res)) return;
 
-  // ✅ AANGEPAST: je kunt nu connectorId meegeven via query:
-  // POST /sync/products?key=...&connectorId=Items_stock_app
   const connectorId = req.query.connectorId || process.env.AFAS_CONNECTOR; // default Items_Core
   const take = Number(req.query.take || 100);
 
-  let skip = 0;
-  let pages = 0;
   let totalUpserted = 0;
 
   try {
-    while (true) {
-      const data = await fetchAfas(connectorId, { skip, take });
-      const rows = data?.rows || [];
-      if (rows.length === 0) break;
-
-      for (const r of rows) {
+    const { pages, totalRows } = await forEachAfasRow(
+      connectorId,
+      { take },
+      async (r) => {
         const itemcode = r.Itemcode ?? null;
-        if (!itemcode) continue;
+        if (!itemcode) return;
 
+        // "E-commerce_beschikbaar": "Ja" => boolean
         const ecomRaw = r["E-commerce_beschikbaar"] ?? null;
         const ecomBool = ecomRaw === "Ja";
 
@@ -275,14 +362,15 @@ app.post("/sync/products", async (req, res) => {
 
         totalUpserted += 1;
       }
+    );
 
-      pages += 1;
-      skip += rows.length;
-
-      if (rows.length < take) break;
-    }
-
-    res.json({ ok: true, connectorId, pages, upserted: totalUpserted });
+    res.json({
+      ok: true,
+      connectorId,
+      pages,
+      rowsFetched: totalRows,
+      upserted: totalUpserted,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
@@ -290,7 +378,438 @@ app.post("/sync/products", async (req, res) => {
 });
 
 /* =======================
+   SYNC CATEGORIES / DESCRIPTIONS / PICTURES / STOCK
+   Best-effort mapping + raw opslaan
+   ======================= */
+
+app.post("/sync/categories", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const connectorId = req.query.connectorId || "Items_Category_app";
+  const take = Number(req.query.take || 200);
+  let upserted = 0;
+
+  try {
+    const { pages, totalRows } = await forEachAfasRow(
+      connectorId,
+      { take },
+      async (r) => {
+        const itemcode = r.Itemcode ?? r.itemcode ?? null;
+        if (!itemcode) return;
+
+        const category_code =
+          r.CategoryCode ??
+          r.Category ??
+          r.CategorieCode ??
+          r.Categorie ??
+          null;
+
+        const category_name = r.CategoryName ?? r.CategorieNaam ?? r.Naam ?? null;
+
+        // PK moet gevuld zijn → fallback op hash van row als code ontbreekt
+        const catCode =
+          (category_code && String(category_code).trim()) ||
+          sha1(JSON.stringify(r));
+
+        await pool.query(
+          `
+          INSERT INTO product_categories (itemcode, category_code, category_name, raw, updated_at)
+          VALUES ($1,$2,$3,$4,NOW())
+          ON CONFLICT (itemcode, category_code) DO UPDATE SET
+            category_name = EXCLUDED.category_name,
+            raw = EXCLUDED.raw,
+            updated_at = NOW()
+          `,
+          [String(itemcode), String(catCode), category_name, r]
+        );
+
+        upserted += 1;
+      }
+    );
+
+    res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+app.post("/sync/descriptions", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const connectorId = req.query.connectorId || "Items_Descriptions_app";
+  const take = Number(req.query.take || 200);
+  let upserted = 0;
+
+  try {
+    const { pages, totalRows } = await forEachAfasRow(
+      connectorId,
+      { take },
+      async (r) => {
+        const itemcode = r.Itemcode ?? r.itemcode ?? null;
+        if (!itemcode) return;
+
+        const langRaw = r.Language ?? r.Taal ?? r.Lang ?? "NL";
+        const lang = String(langRaw || "NL").toUpperCase().trim();
+
+        const description =
+          r.Description ?? r.Omschrijving ?? r.Tekst ?? r.Text ?? null;
+
+        await pool.query(
+          `
+          INSERT INTO product_descriptions (itemcode, lang, description, raw, updated_at)
+          VALUES ($1,$2,$3,$4,NOW())
+          ON CONFLICT (itemcode, lang) DO UPDATE SET
+            description = EXCLUDED.description,
+            raw = EXCLUDED.raw,
+            updated_at = NOW()
+          `,
+          [String(itemcode), lang, description, r]
+        );
+
+        upserted += 1;
+      }
+    );
+
+    res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+app.post("/sync/pictures", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const connectorId = req.query.connectorId || "Items_Pictures_app";
+  const take = Number(req.query.take || 200);
+  let upserted = 0;
+
+  try {
+    const { pages, totalRows } = await forEachAfasRow(
+      connectorId,
+      { take },
+      async (r) => {
+        const itemcode = r.Itemcode ?? r.itemcode ?? null;
+        if (!itemcode) return;
+
+        const url =
+          r.Url ?? r.URL ?? r.PictureUrl ?? r.AfbeeldingUrl ?? r.Link ?? null;
+
+        const sort_order = Number(r.SortOrder ?? r.Volgorde ?? r.Sort ?? 0);
+        const picture_id =
+          (r.PictureId ?? r.ID ?? r.Id ?? null) ||
+          (url ? sha1(url) : sha1(JSON.stringify(r)));
+
+        await pool.query(
+          `
+          INSERT INTO product_pictures (itemcode, picture_id, url, sort_order, raw, updated_at)
+          VALUES ($1,$2,$3,$4,$5,NOW())
+          ON CONFLICT (itemcode, picture_id) DO UPDATE SET
+            url = EXCLUDED.url,
+            sort_order = EXCLUDED.sort_order,
+            raw = EXCLUDED.raw,
+            updated_at = NOW()
+          `,
+          [
+            String(itemcode),
+            String(picture_id),
+            url,
+            Number.isFinite(sort_order) ? sort_order : 0,
+            r,
+          ]
+        );
+
+        upserted += 1;
+      }
+    );
+
+    res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+app.post("/sync/stock", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const connectorId = req.query.connectorId || "Items_stock_app";
+  const take = Number(req.query.take || 200);
+  let upserted = 0;
+
+  try {
+    const { pages, totalRows } = await forEachAfasRow(
+      connectorId,
+      { take },
+      async (r) => {
+        const itemcode = r.Itemcode ?? r.itemcode ?? null;
+        if (!itemcode) return;
+
+        // Soms per magazijn
+        const warehouseRaw = r.Warehouse ?? r.Magazijn ?? r.WarehouseCode ?? null;
+        const warehouse = String(warehouseRaw || "DEFAULT").trim();
+
+        const available_stock =
+          r.Beschikbare_voorraad ?? r.AvailableStock ?? r.Stock ?? null;
+
+        await pool.query(
+          `
+          INSERT INTO product_stock (itemcode, warehouse, available_stock, raw, updated_at)
+          VALUES ($1,$2,$3,$4,NOW())
+          ON CONFLICT (itemcode, warehouse) DO UPDATE SET
+            available_stock = EXCLUDED.available_stock,
+            raw = EXCLUDED.raw,
+            updated_at = NOW()
+          `,
+          [String(itemcode), warehouse, available_stock, r]
+        );
+
+        upserted += 1;
+      }
+    );
+
+    res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+// ✅ 1 knop: alles syncen
+app.post("/sync/all", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const take = Number(req.query.take || 200);
+  const results = {};
+
+  try {
+    // Core eerst (products)
+    results.products = await (async () => {
+      // hergebruik dezelfde logic door direct handler te callen is messy;
+      // dus: simpelweg zelf fetchAfas/DB upsert nogmaals is dubbel.
+      // -> we roepen onze bestaande route-functies niet aan; we doen "mini calls" via functions:
+      let upserted = 0;
+      const connectorId = process.env.AFAS_CONNECTOR || "Items_Core";
+
+      const { pages, totalRows } = await forEachAfasRow(
+        connectorId,
+        { take: Number(req.query.takeProducts || 100) },
+        async (r) => {
+          const itemcode = r.Itemcode ?? null;
+          if (!itemcode) return;
+
+          const ecomRaw = r["E-commerce_beschikbaar"] ?? null;
+          const ecomBool = ecomRaw === "Ja";
+
+          await pool.query(
+            `
+            INSERT INTO products (
+              itemcode,
+              type_item,
+              description_eng,
+              unit,
+              price,
+              outercarton,
+              innercarton,
+              ean,
+              available_stock,
+              ecommerce_available,
+              raw,
+              updated_at
+            ) VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW()
+            )
+            ON CONFLICT (itemcode) DO UPDATE SET
+              type_item = EXCLUDED.type_item,
+              description_eng = EXCLUDED.description_eng,
+              unit = EXCLUDED.unit,
+              price = EXCLUDED.price,
+              outercarton = EXCLUDED.outercarton,
+              innercarton = EXCLUDED.innercarton,
+              ean = EXCLUDED.ean,
+              available_stock = EXCLUDED.available_stock,
+              ecommerce_available = EXCLUDED.ecommerce_available,
+              raw = EXCLUDED.raw,
+              updated_at = NOW()
+            `,
+            [
+              itemcode,
+              r.Type_item ?? null,
+              r.OMSCHRIJVING_ENG ?? null,
+              r.UNIT ?? null,
+              r.Prijs ?? null,
+              r.OUTERCARTON ?? null,
+              r.INNERCARTON ?? null,
+              r["EAN_product__Opgeschoonde_barcode_"] ?? null,
+              r.Beschikbare_voorraad ?? null,
+              ecomBool,
+              r,
+            ]
+          );
+
+          upserted++;
+        }
+      );
+
+      return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
+    })();
+
+    results.categories = await (async () => {
+      let upserted = 0;
+      const connectorId = "Items_Category_app";
+      const { pages, totalRows } = await forEachAfasRow(
+        connectorId,
+        { take },
+        async (r) => {
+          const itemcode = r.Itemcode ?? r.itemcode ?? null;
+          if (!itemcode) return;
+
+          const category_code =
+            r.CategoryCode ??
+            r.Category ??
+            r.CategorieCode ??
+            r.Categorie ??
+            null;
+
+          const category_name =
+            r.CategoryName ?? r.CategorieNaam ?? r.Naam ?? null;
+
+          const catCode =
+            (category_code && String(category_code).trim()) ||
+            sha1(JSON.stringify(r));
+
+          await pool.query(
+            `
+            INSERT INTO product_categories (itemcode, category_code, category_name, raw, updated_at)
+            VALUES ($1,$2,$3,$4,NOW())
+            ON CONFLICT (itemcode, category_code) DO UPDATE SET
+              category_name = EXCLUDED.category_name,
+              raw = EXCLUDED.raw,
+              updated_at = NOW()
+            `,
+            [String(itemcode), String(catCode), category_name, r]
+          );
+          upserted++;
+        }
+      );
+      return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
+    })();
+
+    results.descriptions = await (async () => {
+      let upserted = 0;
+      const connectorId = "Items_Descriptions_app";
+      const { pages, totalRows } = await forEachAfasRow(
+        connectorId,
+        { take },
+        async (r) => {
+          const itemcode = r.Itemcode ?? r.itemcode ?? null;
+          if (!itemcode) return;
+
+          const langRaw = r.Language ?? r.Taal ?? r.Lang ?? "NL";
+          const lang = String(langRaw || "NL").toUpperCase().trim();
+
+          const description =
+            r.Description ?? r.Omschrijving ?? r.Tekst ?? r.Text ?? null;
+
+          await pool.query(
+            `
+            INSERT INTO product_descriptions (itemcode, lang, description, raw, updated_at)
+            VALUES ($1,$2,$3,$4,NOW())
+            ON CONFLICT (itemcode, lang) DO UPDATE SET
+              description = EXCLUDED.description,
+              raw = EXCLUDED.raw,
+              updated_at = NOW()
+            `,
+            [String(itemcode), lang, description, r]
+          );
+          upserted++;
+        }
+      );
+      return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
+    })();
+
+    results.pictures = await (async () => {
+      let upserted = 0;
+      const connectorId = "Items_Pictures_app";
+      const { pages, totalRows } = await forEachAfasRow(
+        connectorId,
+        { take },
+        async (r) => {
+          const itemcode = r.Itemcode ?? r.itemcode ?? null;
+          if (!itemcode) return;
+
+          const url =
+            r.Url ?? r.URL ?? r.PictureUrl ?? r.AfbeeldingUrl ?? r.Link ?? null;
+
+          const sort_order = Number(r.SortOrder ?? r.Volgorde ?? r.Sort ?? 0);
+          const picture_id =
+            (r.PictureId ?? r.ID ?? r.Id ?? null) ||
+            (url ? sha1(url) : sha1(JSON.stringify(r)));
+
+          await pool.query(
+            `
+            INSERT INTO product_pictures (itemcode, picture_id, url, sort_order, raw, updated_at)
+            VALUES ($1,$2,$3,$4,$5,NOW())
+            ON CONFLICT (itemcode, picture_id) DO UPDATE SET
+              url = EXCLUDED.url,
+              sort_order = EXCLUDED.sort_order,
+              raw = EXCLUDED.raw,
+              updated_at = NOW()
+            `,
+            [
+              String(itemcode),
+              String(picture_id),
+              url,
+              Number.isFinite(sort_order) ? sort_order : 0,
+              r,
+            ]
+          );
+          upserted++;
+        }
+      );
+      return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
+    })();
+
+    results.stock = await (async () => {
+      let upserted = 0;
+      const connectorId = "Items_stock_app";
+      const { pages, totalRows } = await forEachAfasRow(
+        connectorId,
+        { take },
+        async (r) => {
+          const itemcode = r.Itemcode ?? r.itemcode ?? null;
+          if (!itemcode) return;
+
+          const warehouseRaw =
+            r.Warehouse ?? r.Magazijn ?? r.WarehouseCode ?? null;
+          const warehouse = String(warehouseRaw || "DEFAULT").trim();
+
+          const available_stock =
+            r.Beschikbare_voorraad ?? r.AvailableStock ?? r.Stock ?? null;
+
+          await pool.query(
+            `
+            INSERT INTO product_stock (itemcode, warehouse, available_stock, raw, updated_at)
+            VALUES ($1,$2,$3,$4,NOW())
+            ON CONFLICT (itemcode, warehouse) DO UPDATE SET
+              available_stock = EXCLUDED.available_stock,
+              raw = EXCLUDED.raw,
+              updated_at = NOW()
+            `,
+            [String(itemcode), warehouse, available_stock, r]
+          );
+          upserted++;
+        }
+      );
+      return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
+    })();
+
+    res.json({ ok: true, results });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+/* =======================
    PRODUCTS API (A3)
+   Alleen ecommerce_available = true
    ======================= */
 
 // GET /products?limit=50&offset=0
