@@ -310,9 +310,8 @@ app.post("/sync/products", async (req, res) => {
         const itemcode = r.Itemcode ?? null;
         if (!itemcode) return;
 
-        // "E-commerce_beschikbaar": "Ja" => boolean
-        const ecomRaw = r["E-commerce_beschikbaar"] ?? null;
-        const ecomBool = ecomRaw === "Ja";
+        // ✅ FIX: AFAS geeft boolean true/false terug
+        const ecomBool = Boolean(r["E-commerce_beschikbaar"]);
 
         await pool.query(
           `
