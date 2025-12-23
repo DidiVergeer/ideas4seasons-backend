@@ -343,7 +343,15 @@ app.get("/products/by-ean/:ean", async (req, res) => {
   try {
     const { rows } = await pool.query(
       `
-      SELECT itemcode, description_eng, ean, price, available_stock
+      SELECT
+        itemcode,
+        description_eng,
+        ean,
+        price,
+        available_stock,
+        outercarton,
+        innercarton,
+        unit
       FROM products
       WHERE ean = $1
         AND ecommerce_available = true
