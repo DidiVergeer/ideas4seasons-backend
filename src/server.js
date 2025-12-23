@@ -19,8 +19,6 @@ const PORT = process.env.PORT || 3000;
    CORS
    ======================= */
 
-// ✅ Sta je dev + render toe
-// ✅ Laat ook "no-origin" toe (native apps / sommige fetches)
 const ALLOWED_ORIGINS = [
   "http://localhost:3000",
   "http://localhost:8081",
@@ -31,17 +29,10 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Geen origin => meestal native app / server-to-server => toelaten
       if (!origin) return cb(null, true);
-
-      // Exacte matches
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-
-      // Expo web / LAN dev kan soms variëren: http://192.168.x.x:8081
-      // (optioneel maar handig)
       if (/^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:8081$/.test(origin))
         return cb(null, true);
-
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -83,6 +74,7 @@ function authMiddleware(req, res, next) {
    AFAS HELPERS
    ======================= */
 function buildAfasAuthHeaderFromData(dataToken) {
+  // AFAS verwacht token als base64 XML
   const xmlToken = `<token><version>1</version><data>${dataToken}</data></token>`;
   const b64 = Buffer.from(xmlToken, "utf8").toString("base64");
   return `AfasToken ${b64}`;
@@ -94,7 +86,7 @@ async function fetchAfas(connectorId, { skip = 0, take = 100 } = {}) {
 
   if (!env || !dataToken || !connectorId) {
     throw new Error(
-      "Missing AFAS env vars (AFAS_ENV / AFAS_TOKEN_DATA / AFAS_CONNECTOR)"
+      "Missing AFAS env vars (AFAS_ENV / AFAS_TOKEN_DATA / connectorId)"
     );
   }
 
@@ -111,7 +103,12 @@ async function fetchAfas(connectorId, { skip = 0, take = 100 } = {}) {
   const text = await res.text();
   if (!res.ok) throw new Error(`AFAS ${res.status}: ${text}`);
 
-  return JSON.parse(text);
+  // Soms geeft AFAS lege body bij fouten; hier willen we veilige parse
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(`AFAS invalid JSON: ${text}`);
+  }
 }
 
 /* =======================
@@ -121,6 +118,7 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
+// bestaande health/afas (blijft)
 app.get("/health/afas", async (req, res) => {
   try {
     const connectorId = process.env.AFAS_CONNECTOR;
@@ -130,6 +128,24 @@ app.get("/health/afas", async (req, res) => {
       ok: true,
       env: process.env.AFAS_ENV,
       connectorId,
+      sample: data?.rows?.[0] ?? null,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+// ✅ NIEUW: test elke connector direct via backend (geen PowerShell tokens nodig)
+app.get("/health/afas/:connectorId", async (req, res) => {
+  try {
+    const connectorId = req.params.connectorId;
+    const data = await fetchAfas(connectorId, { skip: 0, take: 3 });
+
+    res.json({
+      ok: true,
+      env: process.env.AFAS_ENV,
+      connectorId,
+      count: data?.rows?.length ?? 0,
       sample: data?.rows?.[0] ?? null,
     });
   } catch (err) {
@@ -189,7 +205,9 @@ app.post("/sync/products", async (req, res) => {
     return res.status(401).json({ ok: false, error: "Invalid setup key" });
   }
 
-  const connectorId = process.env.AFAS_CONNECTOR; // Items_Core
+  // ✅ AANGEPAST: je kunt nu connectorId meegeven via query:
+  // POST /sync/products?key=...&connectorId=Items_stock_app
+  const connectorId = req.query.connectorId || process.env.AFAS_CONNECTOR; // default Items_Core
   const take = Number(req.query.take || 100);
 
   let skip = 0;
@@ -206,7 +224,6 @@ app.post("/sync/products", async (req, res) => {
         const itemcode = r.Itemcode ?? null;
         if (!itemcode) continue;
 
-        // ✅ FIX: "E-commerce_beschikbaar": "Ja" => boolean
         const ecomRaw = r["E-commerce_beschikbaar"] ?? null;
         const ecomBool = ecomRaw === "Ja";
 
@@ -265,7 +282,7 @@ app.post("/sync/products", async (req, res) => {
       if (rows.length < take) break;
     }
 
-    res.json({ ok: true, pages, upserted: totalUpserted });
+    res.json({ ok: true, connectorId, pages, upserted: totalUpserted });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
@@ -274,10 +291,8 @@ app.post("/sync/products", async (req, res) => {
 
 /* =======================
    PRODUCTS API (A3)
-   Alleen ecommerce_available = true
    ======================= */
 
-// ✅ FIX: lijst endpoint geeft nu ook outercarton/innercarton/unit terug
 // GET /products?limit=50&offset=0
 app.get("/products", async (req, res) => {
   const limit = Number(req.query.limit) || 50;
