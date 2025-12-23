@@ -277,6 +277,7 @@ app.post("/sync/products", async (req, res) => {
    Alleen ecommerce_available = true
    ======================= */
 
+// ✅ FIX: lijst endpoint geeft nu ook outercarton/innercarton/unit terug
 // GET /products?limit=50&offset=0
 app.get("/products", async (req, res) => {
   const limit = Number(req.query.limit) || 50;
@@ -285,7 +286,15 @@ app.get("/products", async (req, res) => {
   try {
     const { rows } = await pool.query(
       `
-      SELECT itemcode, description_eng, ean, price, available_stock
+      SELECT
+        itemcode,
+        description_eng,
+        ean,
+        price,
+        available_stock,
+        outercarton,
+        innercarton,
+        unit
       FROM products
       WHERE ecommerce_available = true
       ORDER BY itemcode
