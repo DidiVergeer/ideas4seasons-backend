@@ -41,7 +41,8 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "25mb" })); // base64 afbeeldingen kunnen groot zijn
+// base64 afbeeldingen kunnen groot zijn
+app.use(express.json({ limit: "50mb" }));
 
 /* =======================
    DATABASE
@@ -175,13 +176,9 @@ function normalizeBase64(v) {
 
 function guessMimeFromBase64(b64) {
   if (!b64) return "image/jpeg";
-  // JPEG start meestal met "/9j"
-  if (b64.startsWith("/9j")) return "image/jpeg";
-  // PNG start meestal met "iVBOR"
-  if (b64.startsWith("iVBOR")) return "image/png";
-  // GIF start "R0lGOD"
-  if (b64.startsWith("R0lGOD")) return "image/gif";
-  // fallback
+  if (b64.startsWith("/9j")) return "image/jpeg"; // JPEG
+  if (b64.startsWith("iVBOR")) return "image/png"; // PNG
+  if (b64.startsWith("R0lGOD")) return "image/gif"; // GIF
   return "image/jpeg";
 }
 
@@ -241,7 +238,7 @@ app.get("/db-test", async (req, res) => {
 });
 
 /* =======================
-   DB SETUP (A1)
+   DB SETUP
    ======================= */
 app.post("/db/setup-products", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
@@ -299,12 +296,24 @@ app.post("/db/setup-afas-extra", async (req, res) => {
       );
     `);
 
-    // url = data-url ("data:image/jpeg;base64,...") of gewone URL
+    /**
+     * product_pictures:
+     * - image_base64 + mime: echte afbeelding
+     * - url: data-url voor frontend (handig / backward compatible)
+     * - kind: MAIN / SFEER_1..SFEER_5
+     * - filename/original_file/location: uit AFAS velden (indien aanwezig)
+     */
     await pool.query(`
       CREATE TABLE IF NOT EXISTS product_pictures (
         itemcode TEXT NOT NULL,
         picture_id TEXT NOT NULL,
+        kind TEXT NULL,
         url TEXT NULL,
+        image_base64 TEXT NULL,
+        mime TEXT NULL,
+        filename TEXT NULL,
+        original_file TEXT NULL,
+        location TEXT NULL,
         sort_order INT NULL,
         raw JSONB NULL,
         updated_at TIMESTAMP DEFAULT NOW(),
@@ -313,8 +322,8 @@ app.post("/db/setup-afas-extra", async (req, res) => {
     `);
 
     await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_product_pictures_item_sort
-      ON product_pictures (itemcode, sort_order, picture_id);
+      CREATE INDEX IF NOT EXISTS idx_product_pictures_item_kind_sort
+      ON product_pictures (itemcode, kind, sort_order, picture_id);
     `);
 
     await pool.query(`
@@ -335,8 +344,35 @@ app.post("/db/setup-afas-extra", async (req, res) => {
   }
 });
 
+// Als je al een oude product_pictures had: 1x migreren
+app.post("/db/migrate-pictures-v2", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    await pool.query(`
+      ALTER TABLE product_pictures
+        ADD COLUMN IF NOT EXISTS kind TEXT NULL,
+        ADD COLUMN IF NOT EXISTS image_base64 TEXT NULL,
+        ADD COLUMN IF NOT EXISTS mime TEXT NULL,
+        ADD COLUMN IF NOT EXISTS filename TEXT NULL,
+        ADD COLUMN IF NOT EXISTS original_file TEXT NULL,
+        ADD COLUMN IF NOT EXISTS location TEXT NULL;
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_product_pictures_item_kind_sort
+      ON product_pictures (itemcode, kind, sort_order, picture_id);
+    `);
+
+    res.json({ ok: true, message: "product_pictures migrated to v2" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 /* =======================
-   SYNC PRODUCTS (A2)
+   SYNC PRODUCTS
    ======================= */
 app.post("/sync/products", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
@@ -489,67 +525,158 @@ app.post("/sync/descriptions", async (req, res) => {
 });
 
 /**
- * ✅ BELANGRIJK:
- * Jouw AFAS connector "Items_Pictures_app" levert geen URL, maar base64 in velden:
- *  - Afbeelding   = product foto (1x)
- *  - Afbeelding_1..Afbeelding_5 = sfeer foto’s (0..5, niet altijd gevuld)
+ * ✅ PICTURES SYNC
+ * AFAS connector "Items_Pictures_app" levert base64 in velden:
+ *  - Afbeelding (MAIN)
+ *  - Afbeelding_1..Afbeelding_5 (SFEER_1..SFEER_5)
  *
- * We slaan ze op in product_pictures.url als data-url (data:image/...;base64,...)
- * Zodat de frontend meteen iets kan renderen en image_url NOOIT null hoeft te zijn
- * (we COALESCE later naar '' als er echt niets is).
+ * Jij hebt daarnaast (optioneel) extra velden toegevoegd:
+ *  - Bestandsnaam_MAIN / Origineel_bestand_MAIN / Bestandslocatie_MAIN
+ *  - Bestandsnaam_SFEER_1..5 / Origineel_bestand_SFEER_1..5 / Bestandslocatie_SFEER_1..5
+ *
+ * Wij slaan op:
+ *  - image_base64 + mime
+ *  - url als data-url (voor frontend)
+ *  - kind MAIN / SFEER_1..5
+ *  - filename / original_file / location (als beschikbaar)
  */
 app.post("/sync/pictures", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   const connectorId = req.query.connectorId || "Items_Pictures_app";
   const take = Number(req.query.take || 200);
-  let upserted = 0;
+  let rowsUpserted = 0;
   let imagesSaved = 0;
+
+  const slots = [
+    {
+      kind: "MAIN",
+      b64Key: "Afbeelding",
+      sort: 0,
+      filenameKey: "Bestandsnaam_MAIN",
+      originalKey: "Origineel_bestand_MAIN",
+      locationKey: "Bestandslocatie_MAIN",
+    },
+    {
+      kind: "SFEER_1",
+      b64Key: "Afbeelding_1",
+      sort: 1,
+      filenameKey: "Bestandsnaam_SFEER_1",
+      originalKey: "Origineel_bestand_SFEER_1",
+      locationKey: "Bestandslocatie_SFEER_1",
+    },
+    {
+      kind: "SFEER_2",
+      b64Key: "Afbeelding_2",
+      sort: 2,
+      filenameKey: "Bestandsnaam_SFEER_2",
+      originalKey: "Origineel_bestand_SFEER_2",
+      locationKey: "Bestandslocatie_SFEER_2",
+    },
+    {
+      kind: "SFEER_3",
+      b64Key: "Afbeelding_3",
+      sort: 3,
+      filenameKey: "Bestandsnaam_SFEER_3",
+      originalKey: "Origineel_bestand_SFEER_3",
+      locationKey: "Bestandslocatie_SFEER_3",
+    },
+    {
+      kind: "SFEER_4",
+      b64Key: "Afbeelding_4",
+      sort: 4,
+      filenameKey: "Bestandsnaam_SFEER_4",
+      originalKey: "Origineel_bestand_SFEER_4",
+      locationKey: "Bestandslocatie_SFEER_4",
+    },
+    {
+      kind: "SFEER_5",
+      b64Key: "Afbeelding_5",
+      sort: 5,
+      filenameKey: "Bestandsnaam_SFEER_5",
+      originalKey: "Origineel_bestand_SFEER_5",
+      locationKey: "Bestandslocatie_SFEER_5",
+    },
+  ];
 
   try {
     const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
       const itemcode = r.Itemcode ?? r.itemcode ?? null;
       if (!itemcode) return;
 
-      // 1 productfoto + 5 sfeerfoto's
-      const fields = [
-        { key: "Afbeelding", sort: 0 },
-        { key: "Afbeelding_1", sort: 1 },
-        { key: "Afbeelding_2", sort: 2 },
-        { key: "Afbeelding_3", sort: 3 },
-        { key: "Afbeelding_4", sort: 4 },
-        { key: "Afbeelding_5", sort: 5 },
-      ];
-
-      for (const f of fields) {
-        const b64 = normalizeBase64(r[f.key]);
+      for (const s of slots) {
+        const b64 = normalizeBase64(r[s.b64Key]);
         if (!b64) continue;
 
-        const dataUrl = base64ToDataUrl(b64);
-        if (!dataUrl) continue;
+        const mime = guessMimeFromBase64(b64);
+        const dataUrl = `data:${mime};base64,${b64}`;
 
-        const picture_id = sha1(`${itemcode}:${f.key}:${b64.slice(0, 50)}`);
+        // metadata (kan leeg zijn als AFAS ze niet meestuurt)
+        const filename = r[s.filenameKey] ?? null;
+        const original_file = r[s.originalKey] ?? null;
+        const location = r[s.locationKey] ?? null;
+
+        // stabiele id op basis van item + kind + (orig/location) + begin van base64
+        const pidSeed = [
+          String(itemcode),
+          s.kind,
+          original_file ? String(original_file) : "",
+          location ? String(location) : "",
+          b64.slice(0, 80),
+        ].join("|");
+
+        const picture_id = sha1(pidSeed);
 
         await pool.query(
           `
-          INSERT INTO product_pictures (itemcode, picture_id, url, sort_order, raw, updated_at)
-          VALUES ($1,$2,$3,$4,$5,NOW())
+          INSERT INTO product_pictures (
+            itemcode, picture_id, kind,
+            url, image_base64, mime,
+            filename, original_file, location,
+            sort_order, raw, updated_at
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
           ON CONFLICT (itemcode, picture_id) DO UPDATE SET
+            kind = EXCLUDED.kind,
             url = EXCLUDED.url,
+            image_base64 = EXCLUDED.image_base64,
+            mime = EXCLUDED.mime,
+            filename = EXCLUDED.filename,
+            original_file = EXCLUDED.original_file,
+            location = EXCLUDED.location,
             sort_order = EXCLUDED.sort_order,
             raw = EXCLUDED.raw,
             updated_at = NOW()
           `,
-          [String(itemcode), String(picture_id), dataUrl, f.sort, r]
+          [
+            String(itemcode),
+            String(picture_id),
+            s.kind,
+            dataUrl,
+            b64,
+            mime,
+            filename ? String(filename) : null,
+            original_file ? String(original_file) : null,
+            location ? String(location) : null,
+            s.sort,
+            r,
+          ]
         );
 
         imagesSaved += 1;
       }
 
-      upserted += 1;
+      rowsUpserted += 1;
     });
 
-    res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted, imagesSaved });
+    res.json({
+      ok: true,
+      connectorId,
+      pages,
+      rowsFetched: totalRows,
+      upsertedRows: rowsUpserted,
+      imagesSaved,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
@@ -602,10 +729,10 @@ app.post("/sync/all", async (req, res) => {
   const results = {};
 
   try {
-    // products
     results.products = await (async () => {
       let upserted = 0;
       const connectorId = process.env.AFAS_CONNECTOR || "Items_Core";
+
       const { pages, totalRows } = await forEachAfasRow(
         connectorId,
         { take: Number(req.query.takeProducts || 100) },
@@ -660,6 +787,7 @@ app.post("/sync/all", async (req, res) => {
               r,
             ]
           );
+
           upserted++;
         }
       );
@@ -667,7 +795,6 @@ app.post("/sync/all", async (req, res) => {
       return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
     })();
 
-    // categories
     results.categories = await (async () => {
       let upserted = 0;
       const connectorId = "Items_Category_app";
@@ -696,7 +823,6 @@ app.post("/sync/all", async (req, res) => {
       return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
     })();
 
-    // descriptions
     results.descriptions = await (async () => {
       let upserted = 0;
       const connectorId = "Items_Descriptions_app";
@@ -725,57 +851,95 @@ app.post("/sync/all", async (req, res) => {
       return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
     })();
 
-    // pictures (base64 fields)
     results.pictures = await (async () => {
-      let upserted = 0;
+      // hergebruik dezelfde logic als /sync/pictures
+      const fakeReq = { query: req.query };
+      const fakeRes = {};
+      // (simpel) gewoon dezelfde endpoint logic nogmaals aanroepen:
+      // we doen hier geen "app.handle" truc; we copy/pasten wat return info
+      let upsertedRows = 0;
       let imagesSaved = 0;
       const connectorId = "Items_Pictures_app";
+
+      const slots = [
+        { kind: "MAIN", b64Key: "Afbeelding", sort: 0, filenameKey: "Bestandsnaam_MAIN", originalKey: "Origineel_bestand_MAIN", locationKey: "Bestandslocatie_MAIN" },
+        { kind: "SFEER_1", b64Key: "Afbeelding_1", sort: 1, filenameKey: "Bestandsnaam_SFEER_1", originalKey: "Origineel_bestand_SFEER_1", locationKey: "Bestandslocatie_SFEER_1" },
+        { kind: "SFEER_2", b64Key: "Afbeelding_2", sort: 2, filenameKey: "Bestandsnaam_SFEER_2", originalKey: "Origineel_bestand_SFEER_2", locationKey: "Bestandslocatie_SFEER_2" },
+        { kind: "SFEER_3", b64Key: "Afbeelding_3", sort: 3, filenameKey: "Bestandsnaam_SFEER_3", originalKey: "Origineel_bestand_SFEER_3", locationKey: "Bestandslocatie_SFEER_3" },
+        { kind: "SFEER_4", b64Key: "Afbeelding_4", sort: 4, filenameKey: "Bestandsnaam_SFEER_4", originalKey: "Origineel_bestand_SFEER_4", locationKey: "Bestandslocatie_SFEER_4" },
+        { kind: "SFEER_5", b64Key: "Afbeelding_5", sort: 5, filenameKey: "Bestandsnaam_SFEER_5", originalKey: "Origineel_bestand_SFEER_5", locationKey: "Bestandslocatie_SFEER_5" },
+      ];
 
       const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
         const itemcode = r.Itemcode ?? r.itemcode ?? null;
         if (!itemcode) return;
 
-        const fields = [
-          { key: "Afbeelding", sort: 0 },
-          { key: "Afbeelding_1", sort: 1 },
-          { key: "Afbeelding_2", sort: 2 },
-          { key: "Afbeelding_3", sort: 3 },
-          { key: "Afbeelding_4", sort: 4 },
-          { key: "Afbeelding_5", sort: 5 },
-        ];
-
-        for (const f of fields) {
-          const b64 = normalizeBase64(r[f.key]);
+        for (const s of slots) {
+          const b64 = normalizeBase64(r[s.b64Key]);
           if (!b64) continue;
 
-          const dataUrl = base64ToDataUrl(b64);
-          if (!dataUrl) continue;
+          const mime = guessMimeFromBase64(b64);
+          const dataUrl = `data:${mime};base64,${b64}`;
 
-          const picture_id = sha1(`${itemcode}:${f.key}:${b64.slice(0, 50)}`);
+          const filename = r[s.filenameKey] ?? null;
+          const original_file = r[s.originalKey] ?? null;
+          const location = r[s.locationKey] ?? null;
+
+          const pidSeed = [
+            String(itemcode),
+            s.kind,
+            original_file ? String(original_file) : "",
+            location ? String(location) : "",
+            b64.slice(0, 80),
+          ].join("|");
+
+          const picture_id = sha1(pidSeed);
 
           await pool.query(
             `
-            INSERT INTO product_pictures (itemcode, picture_id, url, sort_order, raw, updated_at)
-            VALUES ($1,$2,$3,$4,$5,NOW())
+            INSERT INTO product_pictures (
+              itemcode, picture_id, kind,
+              url, image_base64, mime,
+              filename, original_file, location,
+              sort_order, raw, updated_at
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
             ON CONFLICT (itemcode, picture_id) DO UPDATE SET
+              kind = EXCLUDED.kind,
               url = EXCLUDED.url,
+              image_base64 = EXCLUDED.image_base64,
+              mime = EXCLUDED.mime,
+              filename = EXCLUDED.filename,
+              original_file = EXCLUDED.original_file,
+              location = EXCLUDED.location,
               sort_order = EXCLUDED.sort_order,
               raw = EXCLUDED.raw,
               updated_at = NOW()
             `,
-            [String(itemcode), String(picture_id), dataUrl, f.sort, r]
+            [
+              String(itemcode),
+              String(picture_id),
+              s.kind,
+              dataUrl,
+              b64,
+              mime,
+              filename ? String(filename) : null,
+              original_file ? String(original_file) : null,
+              location ? String(location) : null,
+              s.sort,
+              r,
+            ]
           );
 
           imagesSaved++;
         }
 
-        upserted++;
+        upsertedRows++;
       });
 
-      return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted, imagesSaved };
+      return { ok: true, connectorId, pages, rowsFetched: totalRows, upsertedRows, imagesSaved };
     })();
 
-    // stock
     results.stock = await (async () => {
       let upserted = 0;
       const connectorId = "Items_stock_app";
@@ -812,10 +976,9 @@ app.post("/sync/all", async (req, res) => {
 });
 
 /* =======================
-   PRODUCTS API (A3)
+   PRODUCTS API
    Alleen ecommerce_available = true
    + images (main + all)
-   ✅ image_url NOOIT null: we COALESCE naar '' (lege string)
    ======================= */
 
 // GET /products?limit=50&offset=0
@@ -836,13 +999,14 @@ app.get("/products", async (req, res) => {
         p.innercarton,
         p.unit,
 
-        -- ✅ 1 productfoto als die bestaat, anders '' (geen null)
+        -- ✅ MAIN foto als die bestaat, anders eerste (en anders '')
         COALESCE((
           SELECT pic.url
           FROM product_pictures pic
           WHERE pic.itemcode = p.itemcode
             AND pic.url IS NOT NULL
           ORDER BY
+            CASE WHEN pic.kind = 'MAIN' THEN 0 ELSE 1 END,
             COALESCE(pic.sort_order, 999),
             pic.picture_id
           LIMIT 1
@@ -876,7 +1040,11 @@ app.get("/products/:itemcode", async (req, res) => {
         -- ✅ array van alle afbeeldingen (voor swipe)
         COALESCE(
           (
-            SELECT json_agg(pic.url ORDER BY COALESCE(pic.sort_order, 999), pic.picture_id)
+            SELECT json_agg(pic.url ORDER BY
+              CASE WHEN pic.kind = 'MAIN' THEN 0 ELSE 1 END,
+              COALESCE(pic.sort_order, 999),
+              pic.picture_id
+            )
             FROM product_pictures pic
             WHERE pic.itemcode = p.itemcode
               AND pic.url IS NOT NULL
@@ -884,13 +1052,16 @@ app.get("/products/:itemcode", async (req, res) => {
           '[]'::json
         ) AS image_urls,
 
-        -- ✅ ook main image erbij (geen null)
+        -- ✅ main image erbij (geen null)
         COALESCE((
           SELECT pic.url
           FROM product_pictures pic
           WHERE pic.itemcode = p.itemcode
             AND pic.url IS NOT NULL
-          ORDER BY COALESCE(pic.sort_order, 999), pic.picture_id
+          ORDER BY
+            CASE WHEN pic.kind = 'MAIN' THEN 0 ELSE 1 END,
+            COALESCE(pic.sort_order, 999),
+            pic.picture_id
           LIMIT 1
         ), '') AS image_url
 
@@ -933,7 +1104,10 @@ app.get("/products/by-ean/:ean", async (req, res) => {
         FROM product_pictures pp
         WHERE pp.itemcode = p.itemcode
           AND pp.url IS NOT NULL
-        ORDER BY COALESCE(pp.sort_order, 999) ASC, pp.picture_id ASC
+        ORDER BY
+          CASE WHEN pp.kind = 'MAIN' THEN 0 ELSE 1 END,
+          COALESCE(pp.sort_order, 999),
+          pp.picture_id
         LIMIT 1
       ) pic_main ON TRUE
       WHERE p.ean = $1
@@ -1069,11 +1243,13 @@ app.get("/debug/pictures/count", async (req, res) => {
   }
 });
 
+// sample: laat alleen preview zien (niet hele base64)
 app.get("/debug/pictures/sample", async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT itemcode, picture_id,
+      SELECT itemcode, picture_id, kind,
              CASE WHEN url IS NULL THEN NULL ELSE LEFT(url, 60) || '...' END AS url_preview,
+             filename, original_file, location,
              sort_order, updated_at
       FROM product_pictures
       ORDER BY updated_at DESC
@@ -1091,12 +1267,16 @@ app.get("/debug/pictures/:itemcode", async (req, res) => {
   try {
     const r = await pool.query(
       `
-      SELECT itemcode, picture_id,
+      SELECT itemcode, picture_id, kind,
              CASE WHEN url IS NULL THEN NULL ELSE LEFT(url, 60) || '...' END AS url_preview,
+             filename, original_file, location,
              sort_order, updated_at
       FROM product_pictures
       WHERE itemcode = $1
-      ORDER BY COALESCE(sort_order, 999), picture_id
+      ORDER BY
+        CASE WHEN kind = 'MAIN' THEN 0 ELSE 1 END,
+        COALESCE(sort_order, 999),
+        picture_id
       `,
       [itemcode]
     );
