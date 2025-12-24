@@ -557,7 +557,8 @@ app.post("/sync/pictures", async (req, res) => {
         const original_file = r[s.originalKey] ?? null;
         const location = r[s.locationKey] ?? null;
 
-        const stableId = (original_file || location || `${itemcode}-${s.kind}`).toString()
+        // ✅ stabiele ID (belangrijk!)
+        const stableId = String(original_file || location || `${itemcode}-${s.kind}`);
         const picture_id = sha1(stableId);
 
         await pool.query(
@@ -649,11 +650,9 @@ app.post("/sync/stock", async (req, res) => {
 
 /* =======================
    PRODUCTS API
-   - robust: als pictures-kolommen niet matchen -> fallback zonder images
    ======================= */
 
 async function queryProductsWithSafeImage(limit, offset) {
-  // probe 1: met image subquery
   const qWithImage = `
     SELECT
       p.itemcode,
@@ -685,7 +684,6 @@ async function queryProductsWithSafeImage(limit, offset) {
     const { rows } = await pool.query(qWithImage, [limit, offset]);
     return { rows, usedFallback: false };
   } catch (e) {
-    // fallback: zonder image subquery (altijd products terug)
     console.error("queryProductsWithSafeImage failed; fallback without images:", e.message || e);
 
     const qNoImage = `
@@ -736,7 +734,6 @@ app.get("/products/:itemcode", async (req, res) => {
   const { itemcode } = req.params;
 
   try {
-    // probe detail met images
     const q = `
       SELECT
         p.*,
@@ -1082,6 +1079,45 @@ app.post("/db/reset-pictures", async (req, res) => {
   }
 });
 
+/* =======================
+   BROWSER TRIGGERS (TEMP)
+   - hiermee kun je reset/sync in de browser doen (GET)
+   - later weer verwijderen
+   ======================= */
+
+// GET reset (browser)
+app.get("/debug/reset-pictures", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    await pool.query("TRUNCATE TABLE product_pictures;");
+    res.json({ ok: true, message: "product_pictures truncated" });
+  } catch (err) {
+    console.error("debug/reset-pictures:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+// GET sync (browser) -> triggert intern POST /sync/pictures
+app.get("/debug/run-sync-pictures", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const take = Number(req.query.take || 200);
+
+  try {
+    // interne call naar eigen server
+    const internalUrl = `http://127.0.0.1:${PORT}/sync/pictures?key=${encodeURIComponent(
+      req.query.key
+    )}&take=${take}`;
+
+    const r = await fetchFn(internalUrl, { method: "POST" });
+    const text = await r.text();
+    res.status(r.status).type("application/json").send(text);
+  } catch (err) {
+    console.error("debug/run-sync-pictures:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
 
 /* =======================
    START SERVER
