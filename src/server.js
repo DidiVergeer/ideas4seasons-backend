@@ -69,7 +69,6 @@ function sha1(input) {
 }
 
 function parseBool(v) {
-  // AFAS kan true/false booleans sturen, of "Ja"/"Nee"
   if (typeof v === "boolean") return v;
   if (typeof v === "string") {
     const s = v.trim().toLowerCase();
@@ -167,18 +166,16 @@ function normalizeBase64(v) {
   const s = v.trim();
   if (!s) return null;
 
-  // Soms komt er "data:image/...;base64,..." binnen; strip prefix
   const idx = s.indexOf("base64,");
   if (idx >= 0) return s.slice(idx + "base64,".length).trim();
-
   return s;
 }
 
 function guessMimeFromBase64(b64) {
   if (!b64) return "image/jpeg";
-  if (b64.startsWith("/9j")) return "image/jpeg"; // JPEG
-  if (b64.startsWith("iVBOR")) return "image/png"; // PNG
-  if (b64.startsWith("R0lGOD")) return "image/gif"; // GIF
+  if (b64.startsWith("/9j")) return "image/jpeg";
+  if (b64.startsWith("iVBOR")) return "image/png";
+  if (b64.startsWith("R0lGOD")) return "image/gif";
   return "image/jpeg";
 }
 
@@ -187,6 +184,21 @@ function base64ToDataUrl(b64) {
   if (!clean) return null;
   const mime = guessMimeFromBase64(clean);
   return `data:${mime};base64,${clean}`;
+}
+
+/* =======================
+   DB INTROSPECTION (runtime safety)
+   ======================= */
+async function tableColumns(tableName) {
+  const { rows } = await pool.query(
+    `
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_name = $1
+    `,
+    [tableName]
+  );
+  return new Set(rows.map((r) => r.column_name));
 }
 
 /* =======================
@@ -233,7 +245,7 @@ app.get("/db-test", async (req, res) => {
     res.json({ db: "connected" });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ db: "error" });
+    res.status(500).json({ db: "error", error: err.message || String(err) });
   }
 });
 
@@ -262,11 +274,10 @@ app.post("/db/setup-products", async (req, res) => {
     `);
 
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_ean ON products(ean);`);
-
     res.json({ ok: true, message: "products table ready" });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: err.message });
+    console.error("setup-products:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
@@ -296,13 +307,6 @@ app.post("/db/setup-afas-extra", async (req, res) => {
       );
     `);
 
-    /**
-     * product_pictures:
-     * - image_base64 + mime: echte afbeelding
-     * - url: data-url voor frontend (handig / backward compatible)
-     * - kind: MAIN / SFEER_1..SFEER_5
-     * - filename/original_file/location: uit AFAS velden (indien aanwezig)
-     */
     await pool.query(`
       CREATE TABLE IF NOT EXISTS product_pictures (
         itemcode TEXT NOT NULL,
@@ -339,24 +343,28 @@ app.post("/db/setup-afas-extra", async (req, res) => {
 
     res.json({ ok: true, message: "extra AFAS tables ready" });
   } catch (err) {
-    console.error(err);
+    console.error("setup-afas-extra:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
-// Als je al een oude product_pictures had: 1x migreren
-app.post("/db/migrate-pictures-v2", async (req, res) => {
+// Migratie: maak pictures schema “future-proof” (voegt ook url/sort_order toe!)
+app.post("/db/migrate-pictures-v3", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   try {
     await pool.query(`
       ALTER TABLE product_pictures
         ADD COLUMN IF NOT EXISTS kind TEXT NULL,
+        ADD COLUMN IF NOT EXISTS url TEXT NULL,
         ADD COLUMN IF NOT EXISTS image_base64 TEXT NULL,
         ADD COLUMN IF NOT EXISTS mime TEXT NULL,
         ADD COLUMN IF NOT EXISTS filename TEXT NULL,
         ADD COLUMN IF NOT EXISTS original_file TEXT NULL,
-        ADD COLUMN IF NOT EXISTS location TEXT NULL;
+        ADD COLUMN IF NOT EXISTS location TEXT NULL,
+        ADD COLUMN IF NOT EXISTS sort_order INT NULL,
+        ADD COLUMN IF NOT EXISTS raw JSONB NULL,
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
     `);
 
     await pool.query(`
@@ -364,9 +372,9 @@ app.post("/db/migrate-pictures-v2", async (req, res) => {
       ON product_pictures (itemcode, kind, sort_order, picture_id);
     `);
 
-    res.json({ ok: true, message: "product_pictures migrated to v2" });
+    res.json({ ok: true, message: "product_pictures migrated to v3" });
   } catch (err) {
-    console.error(err);
+    console.error("migrate-pictures-v3:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
@@ -392,18 +400,9 @@ app.post("/sync/products", async (req, res) => {
       await pool.query(
         `
         INSERT INTO products (
-          itemcode,
-          type_item,
-          description_eng,
-          unit,
-          price,
-          outercarton,
-          innercarton,
-          ean,
-          available_stock,
-          ecommerce_available,
-          raw,
-          updated_at
+          itemcode, type_item, description_eng, unit, price,
+          outercarton, innercarton, ean, available_stock,
+          ecommerce_available, raw, updated_at
         ) VALUES (
           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW()
         )
@@ -440,7 +439,7 @@ app.post("/sync/products", async (req, res) => {
 
     res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted: totalUpserted });
   } catch (err) {
-    console.error(err);
+    console.error("sync/products:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
@@ -462,7 +461,6 @@ app.post("/sync/categories", async (req, res) => {
 
       const category_code = r.CategoryCode ?? r.Category ?? r.CategorieCode ?? r.Categorie ?? null;
       const category_name = r.CategoryName ?? r.CategorieNaam ?? r.Naam ?? null;
-
       const catCode = (category_code && String(category_code).trim()) || sha1(JSON.stringify(r));
 
       await pool.query(
@@ -482,6 +480,7 @@ app.post("/sync/categories", async (req, res) => {
 
     res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted });
   } catch (err) {
+    console.error("sync/categories:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
@@ -500,7 +499,6 @@ app.post("/sync/descriptions", async (req, res) => {
 
       const langRaw = r.Language ?? r.Taal ?? r.Lang ?? "NL";
       const lang = String(langRaw || "NL").toUpperCase().trim();
-
       const description = r.Description ?? r.Omschrijving ?? r.Tekst ?? r.Text ?? null;
 
       await pool.query(
@@ -520,25 +518,16 @@ app.post("/sync/descriptions", async (req, res) => {
 
     res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted });
   } catch (err) {
+    console.error("sync/descriptions:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
 /**
- * ✅ PICTURES SYNC
- * AFAS connector "Items_Pictures_app" levert base64 in velden:
+ * PICTURES SYNC
+ * Verwachte base64 velden:
  *  - Afbeelding (MAIN)
  *  - Afbeelding_1..Afbeelding_5 (SFEER_1..SFEER_5)
- *
- * Jij hebt daarnaast (optioneel) extra velden toegevoegd:
- *  - Bestandsnaam_MAIN / Origineel_bestand_MAIN / Bestandslocatie_MAIN
- *  - Bestandsnaam_SFEER_1..5 / Origineel_bestand_SFEER_1..5 / Bestandslocatie_SFEER_1..5
- *
- * Wij slaan op:
- *  - image_base64 + mime
- *  - url als data-url (voor frontend)
- *  - kind MAIN / SFEER_1..5
- *  - filename / original_file / location (als beschikbaar)
  */
 app.post("/sync/pictures", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
@@ -549,54 +538,12 @@ app.post("/sync/pictures", async (req, res) => {
   let imagesSaved = 0;
 
   const slots = [
-    {
-      kind: "MAIN",
-      b64Key: "Afbeelding",
-      sort: 0,
-      filenameKey: "Bestandsnaam_MAIN",
-      originalKey: "Origineel_bestand_MAIN",
-      locationKey: "Bestandslocatie_MAIN",
-    },
-    {
-      kind: "SFEER_1",
-      b64Key: "Afbeelding_1",
-      sort: 1,
-      filenameKey: "Bestandsnaam_SFEER_1",
-      originalKey: "Origineel_bestand_SFEER_1",
-      locationKey: "Bestandslocatie_SFEER_1",
-    },
-    {
-      kind: "SFEER_2",
-      b64Key: "Afbeelding_2",
-      sort: 2,
-      filenameKey: "Bestandsnaam_SFEER_2",
-      originalKey: "Origineel_bestand_SFEER_2",
-      locationKey: "Bestandslocatie_SFEER_2",
-    },
-    {
-      kind: "SFEER_3",
-      b64Key: "Afbeelding_3",
-      sort: 3,
-      filenameKey: "Bestandsnaam_SFEER_3",
-      originalKey: "Origineel_bestand_SFEER_3",
-      locationKey: "Bestandslocatie_SFEER_3",
-    },
-    {
-      kind: "SFEER_4",
-      b64Key: "Afbeelding_4",
-      sort: 4,
-      filenameKey: "Bestandsnaam_SFEER_4",
-      originalKey: "Origineel_bestand_SFEER_4",
-      locationKey: "Bestandslocatie_SFEER_4",
-    },
-    {
-      kind: "SFEER_5",
-      b64Key: "Afbeelding_5",
-      sort: 5,
-      filenameKey: "Bestandsnaam_SFEER_5",
-      originalKey: "Origineel_bestand_SFEER_5",
-      locationKey: "Bestandslocatie_SFEER_5",
-    },
+    { kind: "MAIN", b64Key: "Afbeelding", sort: 0, filenameKey: "Bestandsnaam_MAIN", originalKey: "Origineel_bestand_MAIN", locationKey: "Bestandslocatie_MAIN" },
+    { kind: "SFEER_1", b64Key: "Afbeelding_1", sort: 1, filenameKey: "Bestandsnaam_SFEER_1", originalKey: "Origineel_bestand_SFEER_1", locationKey: "Bestandslocatie_SFEER_1" },
+    { kind: "SFEER_2", b64Key: "Afbeelding_2", sort: 2, filenameKey: "Bestandsnaam_SFEER_2", originalKey: "Origineel_bestand_SFEER_2", locationKey: "Bestandslocatie_SFEER_2" },
+    { kind: "SFEER_3", b64Key: "Afbeelding_3", sort: 3, filenameKey: "Bestandsnaam_SFEER_3", originalKey: "Origineel_bestand_SFEER_3", locationKey: "Bestandslocatie_SFEER_3" },
+    { kind: "SFEER_4", b64Key: "Afbeelding_4", sort: 4, filenameKey: "Bestandsnaam_SFEER_4", originalKey: "Origineel_bestand_SFEER_4", locationKey: "Bestandslocatie_SFEER_4" },
+    { kind: "SFEER_5", b64Key: "Afbeelding_5", sort: 5, filenameKey: "Bestandsnaam_SFEER_5", originalKey: "Origineel_bestand_SFEER_5", locationKey: "Bestandslocatie_SFEER_5" },
   ];
 
   try {
@@ -611,12 +558,10 @@ app.post("/sync/pictures", async (req, res) => {
         const mime = guessMimeFromBase64(b64);
         const dataUrl = `data:${mime};base64,${b64}`;
 
-        // metadata (kan leeg zijn als AFAS ze niet meestuurt)
         const filename = r[s.filenameKey] ?? null;
         const original_file = r[s.originalKey] ?? null;
         const location = r[s.locationKey] ?? null;
 
-        // stabiele id op basis van item + kind + (orig/location) + begin van base64
         const pidSeed = [
           String(itemcode),
           s.kind,
@@ -624,7 +569,6 @@ app.post("/sync/pictures", async (req, res) => {
           location ? String(location) : "",
           b64.slice(0, 80),
         ].join("|");
-
         const picture_id = sha1(pidSeed);
 
         await pool.query(
@@ -669,16 +613,9 @@ app.post("/sync/pictures", async (req, res) => {
       rowsUpserted += 1;
     });
 
-    res.json({
-      ok: true,
-      connectorId,
-      pages,
-      rowsFetched: totalRows,
-      upsertedRows: rowsUpserted,
-      imagesSaved,
-    });
+    res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upsertedRows: rowsUpserted, imagesSaved });
   } catch (err) {
-    console.error(err);
+    console.error("sync/pictures:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
@@ -697,7 +634,6 @@ app.post("/sync/stock", async (req, res) => {
 
       const warehouseRaw = r.Warehouse ?? r.Magazijn ?? r.WarehouseCode ?? null;
       const warehouse = String(warehouseRaw || "DEFAULT").trim();
-
       const available_stock = r.Beschikbare_voorraad ?? r.AvailableStock ?? r.Stock ?? null;
 
       await pool.query(
@@ -717,278 +653,53 @@ app.post("/sync/stock", async (req, res) => {
 
     res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message || String(err) });
-  }
-});
-
-// ✅ 1 knop: alles syncen
-app.post("/sync/all", async (req, res) => {
-  if (!requireSetupKey(req, res)) return;
-
-  const take = Number(req.query.take || 200);
-  const results = {};
-
-  try {
-    results.products = await (async () => {
-      let upserted = 0;
-      const connectorId = process.env.AFAS_CONNECTOR || "Items_Core";
-
-      const { pages, totalRows } = await forEachAfasRow(
-        connectorId,
-        { take: Number(req.query.takeProducts || 100) },
-        async (r) => {
-          const itemcode = r.Itemcode ?? null;
-          if (!itemcode) return;
-
-          const ecomBool = parseBool(r["E-commerce_beschikbaar"]);
-
-          await pool.query(
-            `
-            INSERT INTO products (
-              itemcode,
-              type_item,
-              description_eng,
-              unit,
-              price,
-              outercarton,
-              innercarton,
-              ean,
-              available_stock,
-              ecommerce_available,
-              raw,
-              updated_at
-            ) VALUES (
-              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW()
-            )
-            ON CONFLICT (itemcode) DO UPDATE SET
-              type_item = EXCLUDED.type_item,
-              description_eng = EXCLUDED.description_eng,
-              unit = EXCLUDED.unit,
-              price = EXCLUDED.price,
-              outercarton = EXCLUDED.outercarton,
-              innercarton = EXCLUDED.innercarton,
-              ean = EXCLUDED.ean,
-              available_stock = EXCLUDED.available_stock,
-              ecommerce_available = EXCLUDED.ecommerce_available,
-              raw = EXCLUDED.raw,
-              updated_at = NOW()
-            `,
-            [
-              String(itemcode),
-              r.Type_item ?? null,
-              r.OMSCHRIJVING_ENG ?? null,
-              r.UNIT ?? null,
-              r.Prijs ?? null,
-              r.OUTERCARTON ?? null,
-              r.INNERCARTON ?? null,
-              r["EAN_product__Opgeschoonde_barcode_"] ?? null,
-              r.Beschikbare_voorraad ?? null,
-              ecomBool,
-              r,
-            ]
-          );
-
-          upserted++;
-        }
-      );
-
-      return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
-    })();
-
-    results.categories = await (async () => {
-      let upserted = 0;
-      const connectorId = "Items_Category_app";
-      const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
-        const itemcode = r.Itemcode ?? r.itemcode ?? null;
-        if (!itemcode) return;
-
-        const category_code = r.CategoryCode ?? r.Category ?? r.CategorieCode ?? r.Categorie ?? null;
-        const category_name = r.CategoryName ?? r.CategorieNaam ?? r.Naam ?? null;
-        const catCode = (category_code && String(category_code).trim()) || sha1(JSON.stringify(r));
-
-        await pool.query(
-          `
-          INSERT INTO product_categories (itemcode, category_code, category_name, raw, updated_at)
-          VALUES ($1,$2,$3,$4,NOW())
-          ON CONFLICT (itemcode, category_code) DO UPDATE SET
-            category_name = EXCLUDED.category_name,
-            raw = EXCLUDED.raw,
-            updated_at = NOW()
-          `,
-          [String(itemcode), String(catCode), category_name, r]
-        );
-
-        upserted++;
-      });
-      return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
-    })();
-
-    results.descriptions = await (async () => {
-      let upserted = 0;
-      const connectorId = "Items_Descriptions_app";
-      const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
-        const itemcode = r.Itemcode ?? r.itemcode ?? null;
-        if (!itemcode) return;
-
-        const langRaw = r.Language ?? r.Taal ?? r.Lang ?? "NL";
-        const lang = String(langRaw || "NL").toUpperCase().trim();
-        const description = r.Description ?? r.Omschrijving ?? r.Tekst ?? r.Text ?? null;
-
-        await pool.query(
-          `
-          INSERT INTO product_descriptions (itemcode, lang, description, raw, updated_at)
-          VALUES ($1,$2,$3,$4,NOW())
-          ON CONFLICT (itemcode, lang) DO UPDATE SET
-            description = EXCLUDED.description,
-            raw = EXCLUDED.raw,
-            updated_at = NOW()
-          `,
-          [String(itemcode), lang, description, r]
-        );
-
-        upserted++;
-      });
-      return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
-    })();
-
-    results.pictures = await (async () => {
-      // hergebruik dezelfde logic als /sync/pictures
-      const fakeReq = { query: req.query };
-      const fakeRes = {};
-      // (simpel) gewoon dezelfde endpoint logic nogmaals aanroepen:
-      // we doen hier geen "app.handle" truc; we copy/pasten wat return info
-      let upsertedRows = 0;
-      let imagesSaved = 0;
-      const connectorId = "Items_Pictures_app";
-
-      const slots = [
-        { kind: "MAIN", b64Key: "Afbeelding", sort: 0, filenameKey: "Bestandsnaam_MAIN", originalKey: "Origineel_bestand_MAIN", locationKey: "Bestandslocatie_MAIN" },
-        { kind: "SFEER_1", b64Key: "Afbeelding_1", sort: 1, filenameKey: "Bestandsnaam_SFEER_1", originalKey: "Origineel_bestand_SFEER_1", locationKey: "Bestandslocatie_SFEER_1" },
-        { kind: "SFEER_2", b64Key: "Afbeelding_2", sort: 2, filenameKey: "Bestandsnaam_SFEER_2", originalKey: "Origineel_bestand_SFEER_2", locationKey: "Bestandslocatie_SFEER_2" },
-        { kind: "SFEER_3", b64Key: "Afbeelding_3", sort: 3, filenameKey: "Bestandsnaam_SFEER_3", originalKey: "Origineel_bestand_SFEER_3", locationKey: "Bestandslocatie_SFEER_3" },
-        { kind: "SFEER_4", b64Key: "Afbeelding_4", sort: 4, filenameKey: "Bestandsnaam_SFEER_4", originalKey: "Origineel_bestand_SFEER_4", locationKey: "Bestandslocatie_SFEER_4" },
-        { kind: "SFEER_5", b64Key: "Afbeelding_5", sort: 5, filenameKey: "Bestandsnaam_SFEER_5", originalKey: "Origineel_bestand_SFEER_5", locationKey: "Bestandslocatie_SFEER_5" },
-      ];
-
-      const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
-        const itemcode = r.Itemcode ?? r.itemcode ?? null;
-        if (!itemcode) return;
-
-        for (const s of slots) {
-          const b64 = normalizeBase64(r[s.b64Key]);
-          if (!b64) continue;
-
-          const mime = guessMimeFromBase64(b64);
-          const dataUrl = `data:${mime};base64,${b64}`;
-
-          const filename = r[s.filenameKey] ?? null;
-          const original_file = r[s.originalKey] ?? null;
-          const location = r[s.locationKey] ?? null;
-
-          const pidSeed = [
-            String(itemcode),
-            s.kind,
-            original_file ? String(original_file) : "",
-            location ? String(location) : "",
-            b64.slice(0, 80),
-          ].join("|");
-
-          const picture_id = sha1(pidSeed);
-
-          await pool.query(
-            `
-            INSERT INTO product_pictures (
-              itemcode, picture_id, kind,
-              url, image_base64, mime,
-              filename, original_file, location,
-              sort_order, raw, updated_at
-            )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-            ON CONFLICT (itemcode, picture_id) DO UPDATE SET
-              kind = EXCLUDED.kind,
-              url = EXCLUDED.url,
-              image_base64 = EXCLUDED.image_base64,
-              mime = EXCLUDED.mime,
-              filename = EXCLUDED.filename,
-              original_file = EXCLUDED.original_file,
-              location = EXCLUDED.location,
-              sort_order = EXCLUDED.sort_order,
-              raw = EXCLUDED.raw,
-              updated_at = NOW()
-            `,
-            [
-              String(itemcode),
-              String(picture_id),
-              s.kind,
-              dataUrl,
-              b64,
-              mime,
-              filename ? String(filename) : null,
-              original_file ? String(original_file) : null,
-              location ? String(location) : null,
-              s.sort,
-              r,
-            ]
-          );
-
-          imagesSaved++;
-        }
-
-        upsertedRows++;
-      });
-
-      return { ok: true, connectorId, pages, rowsFetched: totalRows, upsertedRows, imagesSaved };
-    })();
-
-    results.stock = await (async () => {
-      let upserted = 0;
-      const connectorId = "Items_stock_app";
-      const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
-        const itemcode = r.Itemcode ?? r.itemcode ?? null;
-        if (!itemcode) return;
-
-        const warehouseRaw = r.Warehouse ?? r.Magazijn ?? r.WarehouseCode ?? null;
-        const warehouse = String(warehouseRaw || "DEFAULT").trim();
-        const available_stock = r.Beschikbare_voorraad ?? r.AvailableStock ?? r.Stock ?? null;
-
-        await pool.query(
-          `
-          INSERT INTO product_stock (itemcode, warehouse, available_stock, raw, updated_at)
-          VALUES ($1,$2,$3,$4,NOW())
-          ON CONFLICT (itemcode, warehouse) DO UPDATE SET
-            available_stock = EXCLUDED.available_stock,
-            raw = EXCLUDED.raw,
-            updated_at = NOW()
-          `,
-          [String(itemcode), warehouse, available_stock, r]
-        );
-
-        upserted++;
-      });
-      return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
-    })();
-
-    res.json({ ok: true, results });
-  } catch (err) {
-    console.error(err);
+    console.error("sync/stock:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
 /* =======================
    PRODUCTS API
-   Alleen ecommerce_available = true
-   + images (main + all)
+   - robust: als pictures-kolommen niet matchen -> fallback zonder images
    ======================= */
 
-// GET /products?limit=50&offset=0
-app.get("/products", async (req, res) => {
-  const limit = Number(req.query.limit) || 50;
-  const offset = Number(req.query.offset) || 0;
+async function queryProductsWithSafeImage(limit, offset) {
+  // probe 1: met image subquery
+  const qWithImage = `
+    SELECT
+      p.itemcode,
+      p.description_eng,
+      p.ean,
+      p.price,
+      p.available_stock,
+      p.outercarton,
+      p.innercarton,
+      p.unit,
+      COALESCE((
+        SELECT pic.url
+        FROM product_pictures pic
+        WHERE pic.itemcode = p.itemcode
+          AND pic.url IS NOT NULL
+        ORDER BY
+          CASE WHEN pic.kind = 'MAIN' THEN 0 ELSE 1 END,
+          COALESCE(pic.sort_order, 999),
+          pic.picture_id
+        LIMIT 1
+      ), '') AS image_url
+    FROM products p
+    WHERE p.ecommerce_available = true
+    ORDER BY p.itemcode
+    LIMIT $1 OFFSET $2
+  `;
 
   try {
-    const { rows } = await pool.query(
-      `
+    const { rows } = await pool.query(qWithImage, [limit, offset]);
+    return { rows, usedFallback: false };
+  } catch (e) {
+    // fallback: zonder image subquery (altijd products terug)
+    console.error("queryProductsWithSafeImage failed; fallback without images:", e.message || e);
+
+    const qNoImage = `
       SELECT
         p.itemcode,
         p.description_eng,
@@ -998,32 +709,36 @@ app.get("/products", async (req, res) => {
         p.outercarton,
         p.innercarton,
         p.unit,
-
-        -- ✅ MAIN foto als die bestaat, anders eerste (en anders '')
-        COALESCE((
-          SELECT pic.url
-          FROM product_pictures pic
-          WHERE pic.itemcode = p.itemcode
-            AND pic.url IS NOT NULL
-          ORDER BY
-            CASE WHEN pic.kind = 'MAIN' THEN 0 ELSE 1 END,
-            COALESCE(pic.sort_order, 999),
-            pic.picture_id
-          LIMIT 1
-        ), '') AS image_url
-
+        '' AS image_url
       FROM products p
       WHERE p.ecommerce_available = true
       ORDER BY p.itemcode
       LIMIT $1 OFFSET $2
-      `,
-      [limit, offset]
-    );
+    `;
+    const { rows } = await pool.query(qNoImage, [limit, offset]);
+    return { rows, usedFallback: true, error: e.message || String(e) };
+  }
+}
 
-    res.json({ ok: true, limit, offset, count: rows.length, data: rows });
+// GET /products?limit=50&offset=0
+app.get("/products", async (req, res) => {
+  const limit = Number(req.query.limit) || 50;
+  const offset = Number(req.query.offset) || 0;
+
+  try {
+    const result = await queryProductsWithSafeImage(limit, offset);
+    res.json({
+      ok: true,
+      limit,
+      offset,
+      count: result.rows.length,
+      usedFallbackNoImages: Boolean(result.usedFallback),
+      fallbackReason: result.usedFallback ? result.error : null,
+      data: result.rows,
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: "DB error" });
+    console.error("GET /products DB error:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
@@ -1032,12 +747,10 @@ app.get("/products/:itemcode", async (req, res) => {
   const { itemcode } = req.params;
 
   try {
-    const { rows } = await pool.query(
-      `
+    // probe detail met images
+    const q = `
       SELECT
         p.*,
-
-        -- ✅ array van alle afbeeldingen (voor swipe)
         COALESCE(
           (
             SELECT json_agg(pic.url ORDER BY
@@ -1051,8 +764,6 @@ app.get("/products/:itemcode", async (req, res) => {
           ),
           '[]'::json
         ) AS image_urls,
-
-        -- ✅ main image erbij (geen null)
         COALESCE((
           SELECT pic.url
           FROM product_pictures pic
@@ -1064,20 +775,33 @@ app.get("/products/:itemcode", async (req, res) => {
             pic.picture_id
           LIMIT 1
         ), '') AS image_url
-
       FROM products p
       WHERE p.itemcode = $1
         AND p.ecommerce_available = true
       LIMIT 1
-      `,
-      [itemcode]
-    );
+    `;
 
-    if (rows.length === 0) return res.status(404).json({ ok: false, error: "Not found" });
+    let rows;
+    try {
+      ({ rows } = await pool.query(q, [itemcode]));
+    } catch (e) {
+      console.error("GET /products/:itemcode failed; fallback without images:", e.message || e);
+      ({ rows } = await pool.query(
+        `
+        SELECT p.*, '[]'::json AS image_urls, '' AS image_url
+        FROM products p
+        WHERE p.itemcode = $1 AND p.ecommerce_available = true
+        LIMIT 1
+        `,
+        [itemcode]
+      ));
+    }
+
+    if (!rows || rows.length === 0) return res.status(404).json({ ok: false, error: "Not found" });
     res.json({ ok: true, data: rows[0] });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: "DB error" });
+    console.error("GET /products/:itemcode DB error:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
@@ -1086,8 +810,7 @@ app.get("/products/by-ean/:ean", async (req, res) => {
   const { ean } = req.params;
 
   try {
-    const { rows } = await pool.query(
-      `
+    const q = `
       SELECT
         p.itemcode,
         p.description_eng,
@@ -1113,15 +836,32 @@ app.get("/products/by-ean/:ean", async (req, res) => {
       WHERE p.ean = $1
         AND p.ecommerce_available = true
       LIMIT 1
-      `,
-      [ean]
-    );
+    `;
 
-    if (rows.length === 0) return res.status(404).json({ ok: false, error: "Unknown EAN" });
+    let rows;
+    try {
+      ({ rows } = await pool.query(q, [ean]));
+    } catch (e) {
+      console.error("GET /products/by-ean failed; fallback without images:", e.message || e);
+      ({ rows } = await pool.query(
+        `
+        SELECT
+          p.itemcode, p.description_eng, p.ean, p.price, p.available_stock,
+          p.outercarton, p.innercarton, p.unit,
+          '' AS image_url
+        FROM products p
+        WHERE p.ean = $1 AND p.ecommerce_available = true
+        LIMIT 1
+        `,
+        [ean]
+      ));
+    }
+
+    if (!rows || rows.length === 0) return res.status(404).json({ ok: false, error: "Unknown EAN" });
     res.json({ ok: true, data: rows[0] });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: "DB error" });
+    console.error("GET /products/by-ean DB error:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
@@ -1160,8 +900,8 @@ app.post("/admin/setup", async (req, res) => {
 
     res.json({ status: "setup complete", agentId });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "setup failed" });
+    console.error("admin/setup:", err);
+    res.status(500).json({ error: err.message || "setup failed" });
   }
 });
 
@@ -1183,8 +923,8 @@ app.post("/auth/login", async (req, res) => {
     const token = jwt.sign({ agentId: agent.agent_id }, process.env.JWT_SECRET, { expiresIn: "8h" });
     res.json({ token, agentId: agent.agent_id });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "login failed" });
+    console.error("auth/login:", err);
+    res.status(500).json({ error: err.message || "login failed" });
   }
 });
 
@@ -1204,7 +944,7 @@ app.get("/debug/products/count", async (req, res) => {
     res.json({ count: Number(r.rows[0].count) });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "db error" });
+    res.status(500).json({ error: err.message || "db error" });
   }
 });
 
@@ -1214,7 +954,7 @@ app.get("/debug/products/count-ecom", async (req, res) => {
     res.json({ count: Number(r.rows[0].count) });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "db error" });
+    res.status(500).json({ error: err.message || "db error" });
   }
 });
 
@@ -1229,7 +969,23 @@ app.get("/debug/products/columns", async (req, res) => {
     res.json(rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "db error" });
+    res.status(500).json({ error: err.message || "db error" });
+  }
+});
+
+// ✅ nieuw: columns van product_pictures
+app.get("/debug/pictures/columns", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_name = 'product_pictures'
+      ORDER BY ordinal_position
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "db error" });
   }
 });
 
@@ -1239,7 +995,7 @@ app.get("/debug/pictures/count", async (req, res) => {
     res.json({ count: Number(r.rows[0].count) });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "db error" });
+    res.status(500).json({ error: err.message || "db error" });
   }
 });
 
@@ -1258,7 +1014,7 @@ app.get("/debug/pictures/sample", async (req, res) => {
     res.json({ rows: r.rows });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "db error" });
+    res.status(500).json({ error: err.message || "db error" });
   }
 });
 
@@ -1283,7 +1039,7 @@ app.get("/debug/pictures/:itemcode", async (req, res) => {
     res.json({ itemcode, count: r.rows.length, rows: r.rows });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "db error" });
+    res.status(500).json({ error: err.message || "db error" });
   }
 });
 
