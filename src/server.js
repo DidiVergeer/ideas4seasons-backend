@@ -746,7 +746,6 @@ app.post("/sync/all", async (req, res) => {
    ======================= */
 
 // GET /products?limit=50&offset=0
-// ✅ includes image_url (main picture) for cards
 app.get("/products", async (req, res) => {
   const limit = Number(req.query.limit) || 50;
   const offset = Number(req.query.offset) || 0;
@@ -763,16 +762,20 @@ app.get("/products", async (req, res) => {
         p.outercarton,
         p.innercarton,
         p.unit,
-        pic_main.url AS image_url
+
+        -- ✅ ALTIJD 1 productfoto als die bestaat
+        (
+          SELECT pic.url
+          FROM product_pictures pic
+          WHERE pic.itemcode = p.itemcode
+            AND pic.url IS NOT NULL
+          ORDER BY
+            COALESCE(pic.sort_order, 999),
+            pic.picture_id
+          LIMIT 1
+        ) AS image_url
+
       FROM products p
-      LEFT JOIN LATERAL (
-        SELECT pp.url
-        FROM product_pictures pp
-        WHERE pp.itemcode = p.itemcode
-          AND pp.url IS NOT NULL
-        ORDER BY COALESCE(pp.sort_order, 0) ASC, pp.picture_id ASC
-        LIMIT 1
-      ) pic_main ON TRUE
       WHERE p.ecommerce_available = true
       ORDER BY p.itemcode
       LIMIT $1 OFFSET $2
@@ -780,7 +783,13 @@ app.get("/products", async (req, res) => {
       [limit, offset]
     );
 
-    res.json({ ok: true, limit, offset, count: rows.length, data: rows });
+    res.json({
+      ok: true,
+      limit,
+      offset,
+      count: rows.length,
+      data: rows,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, error: "DB error" });
@@ -788,7 +797,6 @@ app.get("/products", async (req, res) => {
 });
 
 // GET /products/:itemcode
-// ✅ includes image_url (main) + image_urls (all) for detail carousel
 app.get("/products/:itemcode", async (req, res) => {
   const { itemcode } = req.params;
 
@@ -797,26 +805,21 @@ app.get("/products/:itemcode", async (req, res) => {
       `
       SELECT
         p.*,
-        pic_main.url AS image_url,
-        COALESCE(pics.image_urls, '[]'::json) AS image_urls
+
+        -- ✅ array van alle afbeeldingen (voor swipe)
+        COALESCE(
+          (
+            SELECT json_agg(pic.url ORDER BY COALESCE(pic.sort_order, 999), pic.picture_id)
+            FROM product_pictures pic
+            WHERE pic.itemcode = p.itemcode
+              AND pic.url IS NOT NULL
+          ),
+          '[]'::json
+        ) AS image_urls
+
       FROM products p
-      LEFT JOIN LATERAL (
-        SELECT pp.url
-        FROM product_pictures pp
-        WHERE pp.itemcode = p.itemcode
-          AND pp.url IS NOT NULL
-        ORDER BY COALESCE(pp.sort_order, 0) ASC, pp.picture_id ASC
-        LIMIT 1
-      ) pic_main ON TRUE
-      LEFT JOIN LATERAL (
-        SELECT json_agg(pp.url ORDER BY COALESCE(pp.sort_order, 0) ASC, pp.picture_id ASC) AS image_urls
-        FROM product_pictures pp
-        WHERE pp.itemcode = p.itemcode
-          AND pp.url IS NOT NULL
-      ) pics ON TRUE
       WHERE p.itemcode = $1
         AND p.ecommerce_available = true
-      LIMIT 1
       `,
       [itemcode]
     );
