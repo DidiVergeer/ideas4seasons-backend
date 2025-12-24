@@ -999,6 +999,53 @@ app.get("/debug/products/columns", async (req, res) => {
   }
 });
 
+// DEBUG: hoeveel pictures hebben we?
+app.get("/debug/pictures/count", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT count(*) FROM product_pictures");
+    res.json({ count: Number(r.rows[0].count) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "db error" });
+  }
+});
+
+// DEBUG: sample pictures (laatste 10)
+app.get("/debug/pictures/sample", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT itemcode, picture_id, url, sort_order, updated_at
+      FROM product_pictures
+      ORDER BY updated_at DESC
+      LIMIT 10
+    `);
+    res.json({ rows: r.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "db error" });
+  }
+});
+
+// DEBUG: pictures voor 1 itemcode
+app.get("/debug/pictures/:itemcode", async (req, res) => {
+  const { itemcode } = req.params;
+  try {
+    const r = await pool.query(
+      `
+      SELECT itemcode, picture_id, url, sort_order, updated_at
+      FROM product_pictures
+      WHERE itemcode = $1
+      ORDER BY COALESCE(sort_order, 999), picture_id
+      `,
+      [itemcode]
+    );
+    res.json({ itemcode, count: r.rows.length, rows: r.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "db error" });
+  }
+});
+
 /* =======================
    START SERVER
    ======================= */
