@@ -32,8 +32,7 @@ app.use(
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      if (/^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:8081$/.test(origin))
-        return cb(null, true);
+      if (/^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:8081$/.test(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -102,9 +101,7 @@ async function fetchAfas(connectorId, { skip = 0, take = 100 } = {}) {
   const dataToken = process.env.AFAS_TOKEN_DATA;
 
   if (!env || !dataToken || !connectorId) {
-    throw new Error(
-      "Missing AFAS env vars (AFAS_ENV / AFAS_TOKEN_DATA / connectorId)"
-    );
+    throw new Error("Missing AFAS env vars (AFAS_ENV / AFAS_TOKEN_DATA / connectorId)");
   }
 
   const url = `https://${env}.rest.afas.online/ProfitRestServices/connectors/${connectorId}?skip=${skip}&take=${take}`;
@@ -273,6 +270,12 @@ app.post("/db/setup-afas-extra", async (req, res) => {
       );
     `);
 
+    // ✅ performance index voor "main image" en carousel
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_product_pictures_item_sort
+      ON product_pictures (itemcode, sort_order, picture_id);
+    `);
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS product_stock (
         itemcode TEXT NOT NULL,
@@ -303,65 +306,61 @@ app.post("/sync/products", async (req, res) => {
   let totalUpserted = 0;
 
   try {
-    const { pages, totalRows } = await forEachAfasRow(
-      connectorId,
-      { take },
-      async (r) => {
-        const itemcode = r.Itemcode ?? null;
-        if (!itemcode) return;
+    const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
+      const itemcode = r.Itemcode ?? null;
+      if (!itemcode) return;
 
-        // ✅ FIX: AFAS geeft boolean true/false terug
-        const ecomBool = Boolean(r["E-commerce_beschikbaar"]);
+      // ✅ FIX: AFAS geeft boolean true/false terug
+      const ecomBool = Boolean(r["E-commerce_beschikbaar"]);
 
-        await pool.query(
-          `
-          INSERT INTO products (
-            itemcode,
-            type_item,
-            description_eng,
-            unit,
-            price,
-            outercarton,
-            innercarton,
-            ean,
-            available_stock,
-            ecommerce_available,
-            raw,
-            updated_at
-          ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW()
-          )
-          ON CONFLICT (itemcode) DO UPDATE SET
-            type_item = EXCLUDED.type_item,
-            description_eng = EXCLUDED.description_eng,
-            unit = EXCLUDED.unit,
-            price = EXCLUDED.price,
-            outercarton = EXCLUDED.outercarton,
-            innercarton = EXCLUDED.innercarton,
-            ean = EXCLUDED.ean,
-            available_stock = EXCLUDED.available_stock,
-            ecommerce_available = EXCLUDED.ecommerce_available,
-            raw = EXCLUDED.raw,
-            updated_at = NOW()
-          `,
-          [
-            itemcode,
-            r.Type_item ?? null,
-            r.OMSCHRIJVING_ENG ?? null,
-            r.UNIT ?? null,
-            r.Prijs ?? null,
-            r.OUTERCARTON ?? null,
-            r.INNERCARTON ?? null,
-            r["EAN_product__Opgeschoonde_barcode_"] ?? null,
-            r.Beschikbare_voorraad ?? null,
-            ecomBool,
-            r,
-          ]
-        );
+      await pool.query(
+        `
+        INSERT INTO products (
+          itemcode,
+          type_item,
+          description_eng,
+          unit,
+          price,
+          outercarton,
+          innercarton,
+          ean,
+          available_stock,
+          ecommerce_available,
+          raw,
+          updated_at
+        ) VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW()
+        )
+        ON CONFLICT (itemcode) DO UPDATE SET
+          type_item = EXCLUDED.type_item,
+          description_eng = EXCLUDED.description_eng,
+          unit = EXCLUDED.unit,
+          price = EXCLUDED.price,
+          outercarton = EXCLUDED.outercarton,
+          innercarton = EXCLUDED.innercarton,
+          ean = EXCLUDED.ean,
+          available_stock = EXCLUDED.available_stock,
+          ecommerce_available = EXCLUDED.ecommerce_available,
+          raw = EXCLUDED.raw,
+          updated_at = NOW()
+        `,
+        [
+          itemcode,
+          r.Type_item ?? null,
+          r.OMSCHRIJVING_ENG ?? null,
+          r.UNIT ?? null,
+          r.Prijs ?? null,
+          r.OUTERCARTON ?? null,
+          r.INNERCARTON ?? null,
+          r["EAN_product__Opgeschoonde_barcode_"] ?? null,
+          r.Beschikbare_voorraad ?? null,
+          ecomBool,
+          r,
+        ]
+      );
 
-        totalUpserted += 1;
-      }
-    );
+      totalUpserted += 1;
+    });
 
     res.json({
       ok: true,
@@ -389,42 +388,32 @@ app.post("/sync/categories", async (req, res) => {
   let upserted = 0;
 
   try {
-    const { pages, totalRows } = await forEachAfasRow(
-      connectorId,
-      { take },
-      async (r) => {
-        const itemcode = r.Itemcode ?? r.itemcode ?? null;
-        if (!itemcode) return;
+    const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
+      const itemcode = r.Itemcode ?? r.itemcode ?? null;
+      if (!itemcode) return;
 
-        const category_code =
-          r.CategoryCode ??
-          r.Category ??
-          r.CategorieCode ??
-          r.Categorie ??
-          null;
+      const category_code =
+        r.CategoryCode ?? r.Category ?? r.CategorieCode ?? r.Categorie ?? null;
 
-        const category_name = r.CategoryName ?? r.CategorieNaam ?? r.Naam ?? null;
+      const category_name = r.CategoryName ?? r.CategorieNaam ?? r.Naam ?? null;
 
-        // PK moet gevuld zijn → fallback op hash van row als code ontbreekt
-        const catCode =
-          (category_code && String(category_code).trim()) ||
-          sha1(JSON.stringify(r));
+      // PK moet gevuld zijn → fallback op hash van row als code ontbreekt
+      const catCode = (category_code && String(category_code).trim()) || sha1(JSON.stringify(r));
 
-        await pool.query(
-          `
-          INSERT INTO product_categories (itemcode, category_code, category_name, raw, updated_at)
-          VALUES ($1,$2,$3,$4,NOW())
-          ON CONFLICT (itemcode, category_code) DO UPDATE SET
-            category_name = EXCLUDED.category_name,
-            raw = EXCLUDED.raw,
-            updated_at = NOW()
-          `,
-          [String(itemcode), String(catCode), category_name, r]
-        );
+      await pool.query(
+        `
+        INSERT INTO product_categories (itemcode, category_code, category_name, raw, updated_at)
+        VALUES ($1,$2,$3,$4,NOW())
+        ON CONFLICT (itemcode, category_code) DO UPDATE SET
+          category_name = EXCLUDED.category_name,
+          raw = EXCLUDED.raw,
+          updated_at = NOW()
+        `,
+        [String(itemcode), String(catCode), category_name, r]
+      );
 
-        upserted += 1;
-      }
-    );
+      upserted += 1;
+    });
 
     res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted });
   } catch (err) {
@@ -440,34 +429,29 @@ app.post("/sync/descriptions", async (req, res) => {
   let upserted = 0;
 
   try {
-    const { pages, totalRows } = await forEachAfasRow(
-      connectorId,
-      { take },
-      async (r) => {
-        const itemcode = r.Itemcode ?? r.itemcode ?? null;
-        if (!itemcode) return;
+    const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
+      const itemcode = r.Itemcode ?? r.itemcode ?? null;
+      if (!itemcode) return;
 
-        const langRaw = r.Language ?? r.Taal ?? r.Lang ?? "NL";
-        const lang = String(langRaw || "NL").toUpperCase().trim();
+      const langRaw = r.Language ?? r.Taal ?? r.Lang ?? "NL";
+      const lang = String(langRaw || "NL").toUpperCase().trim();
 
-        const description =
-          r.Description ?? r.Omschrijving ?? r.Tekst ?? r.Text ?? null;
+      const description = r.Description ?? r.Omschrijving ?? r.Tekst ?? r.Text ?? null;
 
-        await pool.query(
-          `
-          INSERT INTO product_descriptions (itemcode, lang, description, raw, updated_at)
-          VALUES ($1,$2,$3,$4,NOW())
-          ON CONFLICT (itemcode, lang) DO UPDATE SET
-            description = EXCLUDED.description,
-            raw = EXCLUDED.raw,
-            updated_at = NOW()
-          `,
-          [String(itemcode), lang, description, r]
-        );
+      await pool.query(
+        `
+        INSERT INTO product_descriptions (itemcode, lang, description, raw, updated_at)
+        VALUES ($1,$2,$3,$4,NOW())
+        ON CONFLICT (itemcode, lang) DO UPDATE SET
+          description = EXCLUDED.description,
+          raw = EXCLUDED.raw,
+          updated_at = NOW()
+        `,
+        [String(itemcode), lang, description, r]
+      );
 
-        upserted += 1;
-      }
-    );
+      upserted += 1;
+    });
 
     res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted });
   } catch (err) {
@@ -483,43 +467,31 @@ app.post("/sync/pictures", async (req, res) => {
   let upserted = 0;
 
   try {
-    const { pages, totalRows } = await forEachAfasRow(
-      connectorId,
-      { take },
-      async (r) => {
-        const itemcode = r.Itemcode ?? r.itemcode ?? null;
-        if (!itemcode) return;
+    const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
+      const itemcode = r.Itemcode ?? r.itemcode ?? null;
+      if (!itemcode) return;
 
-        const url =
-          r.Url ?? r.URL ?? r.PictureUrl ?? r.AfbeeldingUrl ?? r.Link ?? null;
+      const url = r.Url ?? r.URL ?? r.PictureUrl ?? r.AfbeeldingUrl ?? r.Link ?? null;
 
-        const sort_order = Number(r.SortOrder ?? r.Volgorde ?? r.Sort ?? 0);
-        const picture_id =
-          (r.PictureId ?? r.ID ?? r.Id ?? null) ||
-          (url ? sha1(url) : sha1(JSON.stringify(r)));
+      const sort_order = Number(r.SortOrder ?? r.Volgorde ?? r.Sort ?? 0);
+      const picture_id =
+        (r.PictureId ?? r.ID ?? r.Id ?? null) || (url ? sha1(url) : sha1(JSON.stringify(r)));
 
-        await pool.query(
-          `
-          INSERT INTO product_pictures (itemcode, picture_id, url, sort_order, raw, updated_at)
-          VALUES ($1,$2,$3,$4,$5,NOW())
-          ON CONFLICT (itemcode, picture_id) DO UPDATE SET
-            url = EXCLUDED.url,
-            sort_order = EXCLUDED.sort_order,
-            raw = EXCLUDED.raw,
-            updated_at = NOW()
-          `,
-          [
-            String(itemcode),
-            String(picture_id),
-            url,
-            Number.isFinite(sort_order) ? sort_order : 0,
-            r,
-          ]
-        );
+      await pool.query(
+        `
+        INSERT INTO product_pictures (itemcode, picture_id, url, sort_order, raw, updated_at)
+        VALUES ($1,$2,$3,$4,$5,NOW())
+        ON CONFLICT (itemcode, picture_id) DO UPDATE SET
+          url = EXCLUDED.url,
+          sort_order = EXCLUDED.sort_order,
+          raw = EXCLUDED.raw,
+          updated_at = NOW()
+        `,
+        [String(itemcode), String(picture_id), url, Number.isFinite(sort_order) ? sort_order : 0, r]
+      );
 
-        upserted += 1;
-      }
-    );
+      upserted += 1;
+    });
 
     res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted });
   } catch (err) {
@@ -535,35 +507,30 @@ app.post("/sync/stock", async (req, res) => {
   let upserted = 0;
 
   try {
-    const { pages, totalRows } = await forEachAfasRow(
-      connectorId,
-      { take },
-      async (r) => {
-        const itemcode = r.Itemcode ?? r.itemcode ?? null;
-        if (!itemcode) return;
+    const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
+      const itemcode = r.Itemcode ?? r.itemcode ?? null;
+      if (!itemcode) return;
 
-        // Soms per magazijn
-        const warehouseRaw = r.Warehouse ?? r.Magazijn ?? r.WarehouseCode ?? null;
-        const warehouse = String(warehouseRaw || "DEFAULT").trim();
+      // Soms per magazijn
+      const warehouseRaw = r.Warehouse ?? r.Magazijn ?? r.WarehouseCode ?? null;
+      const warehouse = String(warehouseRaw || "DEFAULT").trim();
 
-        const available_stock =
-          r.Beschikbare_voorraad ?? r.AvailableStock ?? r.Stock ?? null;
+      const available_stock = r.Beschikbare_voorraad ?? r.AvailableStock ?? r.Stock ?? null;
 
-        await pool.query(
-          `
-          INSERT INTO product_stock (itemcode, warehouse, available_stock, raw, updated_at)
-          VALUES ($1,$2,$3,$4,NOW())
-          ON CONFLICT (itemcode, warehouse) DO UPDATE SET
-            available_stock = EXCLUDED.available_stock,
-            raw = EXCLUDED.raw,
-            updated_at = NOW()
-          `,
-          [String(itemcode), warehouse, available_stock, r]
-        );
+      await pool.query(
+        `
+        INSERT INTO product_stock (itemcode, warehouse, available_stock, raw, updated_at)
+        VALUES ($1,$2,$3,$4,NOW())
+        ON CONFLICT (itemcode, warehouse) DO UPDATE SET
+          available_stock = EXCLUDED.available_stock,
+          raw = EXCLUDED.raw,
+          updated_at = NOW()
+        `,
+        [String(itemcode), warehouse, available_stock, r]
+      );
 
-        upserted += 1;
-      }
-    );
+      upserted += 1;
+    });
 
     res.json({ ok: true, connectorId, pages, rowsFetched: totalRows, upserted });
   } catch (err) {
@@ -579,11 +546,7 @@ app.post("/sync/all", async (req, res) => {
   const results = {};
 
   try {
-    // Core eerst (products)
     results.products = await (async () => {
-      // hergebruik dezelfde logic door direct handler te callen is messy;
-      // dus: simpelweg zelf fetchAfas/DB upsert nogmaals is dubbel.
-      // -> we roepen onze bestaande route-functies niet aan; we doen "mini calls" via functions:
       let upserted = 0;
       const connectorId = process.env.AFAS_CONNECTOR || "Items_Core";
 
@@ -653,150 +616,120 @@ app.post("/sync/all", async (req, res) => {
     results.categories = await (async () => {
       let upserted = 0;
       const connectorId = "Items_Category_app";
-      const { pages, totalRows } = await forEachAfasRow(
-        connectorId,
-        { take },
-        async (r) => {
-          const itemcode = r.Itemcode ?? r.itemcode ?? null;
-          if (!itemcode) return;
+      const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
+        const itemcode = r.Itemcode ?? r.itemcode ?? null;
+        if (!itemcode) return;
 
-          const category_code =
-            r.CategoryCode ??
-            r.Category ??
-            r.CategorieCode ??
-            r.Categorie ??
-            null;
+        const category_code =
+          r.CategoryCode ?? r.Category ?? r.CategorieCode ?? r.Categorie ?? null;
 
-          const category_name =
-            r.CategoryName ?? r.CategorieNaam ?? r.Naam ?? null;
+        const category_name = r.CategoryName ?? r.CategorieNaam ?? r.Naam ?? null;
 
-          const catCode =
-            (category_code && String(category_code).trim()) ||
-            sha1(JSON.stringify(r));
+        const catCode = (category_code && String(category_code).trim()) || sha1(JSON.stringify(r));
 
-          await pool.query(
-            `
-            INSERT INTO product_categories (itemcode, category_code, category_name, raw, updated_at)
-            VALUES ($1,$2,$3,$4,NOW())
-            ON CONFLICT (itemcode, category_code) DO UPDATE SET
-              category_name = EXCLUDED.category_name,
-              raw = EXCLUDED.raw,
-              updated_at = NOW()
-            `,
-            [String(itemcode), String(catCode), category_name, r]
-          );
-          upserted++;
-        }
-      );
+        await pool.query(
+          `
+          INSERT INTO product_categories (itemcode, category_code, category_name, raw, updated_at)
+          VALUES ($1,$2,$3,$4,NOW())
+          ON CONFLICT (itemcode, category_code) DO UPDATE SET
+            category_name = EXCLUDED.category_name,
+            raw = EXCLUDED.raw,
+            updated_at = NOW()
+          `,
+          [String(itemcode), String(catCode), category_name, r]
+        );
+
+        upserted++;
+      });
       return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
     })();
 
     results.descriptions = await (async () => {
       let upserted = 0;
       const connectorId = "Items_Descriptions_app";
-      const { pages, totalRows } = await forEachAfasRow(
-        connectorId,
-        { take },
-        async (r) => {
-          const itemcode = r.Itemcode ?? r.itemcode ?? null;
-          if (!itemcode) return;
+      const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
+        const itemcode = r.Itemcode ?? r.itemcode ?? null;
+        if (!itemcode) return;
 
-          const langRaw = r.Language ?? r.Taal ?? r.Lang ?? "NL";
-          const lang = String(langRaw || "NL").toUpperCase().trim();
+        const langRaw = r.Language ?? r.Taal ?? r.Lang ?? "NL";
+        const lang = String(langRaw || "NL").toUpperCase().trim();
 
-          const description =
-            r.Description ?? r.Omschrijving ?? r.Tekst ?? r.Text ?? null;
+        const description = r.Description ?? r.Omschrijving ?? r.Tekst ?? r.Text ?? null;
 
-          await pool.query(
-            `
-            INSERT INTO product_descriptions (itemcode, lang, description, raw, updated_at)
-            VALUES ($1,$2,$3,$4,NOW())
-            ON CONFLICT (itemcode, lang) DO UPDATE SET
-              description = EXCLUDED.description,
-              raw = EXCLUDED.raw,
-              updated_at = NOW()
-            `,
-            [String(itemcode), lang, description, r]
-          );
-          upserted++;
-        }
-      );
+        await pool.query(
+          `
+          INSERT INTO product_descriptions (itemcode, lang, description, raw, updated_at)
+          VALUES ($1,$2,$3,$4,NOW())
+          ON CONFLICT (itemcode, lang) DO UPDATE SET
+            description = EXCLUDED.description,
+            raw = EXCLUDED.raw,
+            updated_at = NOW()
+          `,
+          [String(itemcode), lang, description, r]
+        );
+
+        upserted++;
+      });
       return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
     })();
 
     results.pictures = await (async () => {
       let upserted = 0;
       const connectorId = "Items_Pictures_app";
-      const { pages, totalRows } = await forEachAfasRow(
-        connectorId,
-        { take },
-        async (r) => {
-          const itemcode = r.Itemcode ?? r.itemcode ?? null;
-          if (!itemcode) return;
+      const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
+        const itemcode = r.Itemcode ?? r.itemcode ?? null;
+        if (!itemcode) return;
 
-          const url =
-            r.Url ?? r.URL ?? r.PictureUrl ?? r.AfbeeldingUrl ?? r.Link ?? null;
+        const url = r.Url ?? r.URL ?? r.PictureUrl ?? r.AfbeeldingUrl ?? r.Link ?? null;
 
-          const sort_order = Number(r.SortOrder ?? r.Volgorde ?? r.Sort ?? 0);
-          const picture_id =
-            (r.PictureId ?? r.ID ?? r.Id ?? null) ||
-            (url ? sha1(url) : sha1(JSON.stringify(r)));
+        const sort_order = Number(r.SortOrder ?? r.Volgorde ?? r.Sort ?? 0);
+        const picture_id =
+          (r.PictureId ?? r.ID ?? r.Id ?? null) || (url ? sha1(url) : sha1(JSON.stringify(r)));
 
-          await pool.query(
-            `
-            INSERT INTO product_pictures (itemcode, picture_id, url, sort_order, raw, updated_at)
-            VALUES ($1,$2,$3,$4,$5,NOW())
-            ON CONFLICT (itemcode, picture_id) DO UPDATE SET
-              url = EXCLUDED.url,
-              sort_order = EXCLUDED.sort_order,
-              raw = EXCLUDED.raw,
-              updated_at = NOW()
-            `,
-            [
-              String(itemcode),
-              String(picture_id),
-              url,
-              Number.isFinite(sort_order) ? sort_order : 0,
-              r,
-            ]
-          );
-          upserted++;
-        }
-      );
+        await pool.query(
+          `
+          INSERT INTO product_pictures (itemcode, picture_id, url, sort_order, raw, updated_at)
+          VALUES ($1,$2,$3,$4,$5,NOW())
+          ON CONFLICT (itemcode, picture_id) DO UPDATE SET
+            url = EXCLUDED.url,
+            sort_order = EXCLUDED.sort_order,
+            raw = EXCLUDED.raw,
+            updated_at = NOW()
+          `,
+          [String(itemcode), String(picture_id), url, Number.isFinite(sort_order) ? sort_order : 0, r]
+        );
+
+        upserted++;
+      });
       return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
     })();
 
     results.stock = await (async () => {
       let upserted = 0;
       const connectorId = "Items_stock_app";
-      const { pages, totalRows } = await forEachAfasRow(
-        connectorId,
-        { take },
-        async (r) => {
-          const itemcode = r.Itemcode ?? r.itemcode ?? null;
-          if (!itemcode) return;
+      const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
+        const itemcode = r.Itemcode ?? r.itemcode ?? null;
+        if (!itemcode) return;
 
-          const warehouseRaw =
-            r.Warehouse ?? r.Magazijn ?? r.WarehouseCode ?? null;
-          const warehouse = String(warehouseRaw || "DEFAULT").trim();
+        const warehouseRaw = r.Warehouse ?? r.Magazijn ?? r.WarehouseCode ?? null;
+        const warehouse = String(warehouseRaw || "DEFAULT").trim();
 
-          const available_stock =
-            r.Beschikbare_voorraad ?? r.AvailableStock ?? r.Stock ?? null;
+        const available_stock = r.Beschikbare_voorraad ?? r.AvailableStock ?? r.Stock ?? null;
 
-          await pool.query(
-            `
-            INSERT INTO product_stock (itemcode, warehouse, available_stock, raw, updated_at)
-            VALUES ($1,$2,$3,$4,NOW())
-            ON CONFLICT (itemcode, warehouse) DO UPDATE SET
-              available_stock = EXCLUDED.available_stock,
-              raw = EXCLUDED.raw,
-              updated_at = NOW()
-            `,
-            [String(itemcode), warehouse, available_stock, r]
-          );
-          upserted++;
-        }
-      );
+        await pool.query(
+          `
+          INSERT INTO product_stock (itemcode, warehouse, available_stock, raw, updated_at)
+          VALUES ($1,$2,$3,$4,NOW())
+          ON CONFLICT (itemcode, warehouse) DO UPDATE SET
+            available_stock = EXCLUDED.available_stock,
+            raw = EXCLUDED.raw,
+            updated_at = NOW()
+          `,
+          [String(itemcode), warehouse, available_stock, r]
+        );
+
+        upserted++;
+      });
       return { ok: true, connectorId, pages, rowsFetched: totalRows, upserted };
     })();
 
@@ -809,9 +742,11 @@ app.post("/sync/all", async (req, res) => {
 /* =======================
    PRODUCTS API (A3)
    Alleen ecommerce_available = true
+   + images (main + all)
    ======================= */
 
 // GET /products?limit=50&offset=0
+// ✅ includes image_url (main picture) for cards
 app.get("/products", async (req, res) => {
   const limit = Number(req.query.limit) || 50;
   const offset = Number(req.query.offset) || 0;
@@ -820,17 +755,26 @@ app.get("/products", async (req, res) => {
     const { rows } = await pool.query(
       `
       SELECT
-        itemcode,
-        description_eng,
-        ean,
-        price,
-        available_stock,
-        outercarton,
-        innercarton,
-        unit
-      FROM products
-      WHERE ecommerce_available = true
-      ORDER BY itemcode
+        p.itemcode,
+        p.description_eng,
+        p.ean,
+        p.price,
+        p.available_stock,
+        p.outercarton,
+        p.innercarton,
+        p.unit,
+        pic_main.url AS image_url
+      FROM products p
+      LEFT JOIN LATERAL (
+        SELECT pp.url
+        FROM product_pictures pp
+        WHERE pp.itemcode = p.itemcode
+          AND pp.url IS NOT NULL
+        ORDER BY COALESCE(pp.sort_order, 0) ASC, pp.picture_id ASC
+        LIMIT 1
+      ) pic_main ON TRUE
+      WHERE p.ecommerce_available = true
+      ORDER BY p.itemcode
       LIMIT $1 OFFSET $2
       `,
       [limit, offset]
@@ -844,16 +788,35 @@ app.get("/products", async (req, res) => {
 });
 
 // GET /products/:itemcode
+// ✅ includes image_url (main) + image_urls (all) for detail carousel
 app.get("/products/:itemcode", async (req, res) => {
   const { itemcode } = req.params;
 
   try {
     const { rows } = await pool.query(
       `
-      SELECT *
-      FROM products
-      WHERE itemcode = $1
-        AND ecommerce_available = true
+      SELECT
+        p.*,
+        pic_main.url AS image_url,
+        COALESCE(pics.image_urls, '[]'::json) AS image_urls
+      FROM products p
+      LEFT JOIN LATERAL (
+        SELECT pp.url
+        FROM product_pictures pp
+        WHERE pp.itemcode = p.itemcode
+          AND pp.url IS NOT NULL
+        ORDER BY COALESCE(pp.sort_order, 0) ASC, pp.picture_id ASC
+        LIMIT 1
+      ) pic_main ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT json_agg(pp.url ORDER BY COALESCE(pp.sort_order, 0) ASC, pp.picture_id ASC) AS image_urls
+        FROM product_pictures pp
+        WHERE pp.itemcode = p.itemcode
+          AND pp.url IS NOT NULL
+      ) pics ON TRUE
+      WHERE p.itemcode = $1
+        AND p.ecommerce_available = true
+      LIMIT 1
       `,
       [itemcode]
     );
@@ -870,6 +833,7 @@ app.get("/products/:itemcode", async (req, res) => {
 });
 
 // GET /products/by-ean/:ean
+// ✅ includes image_url (main) for scanner result
 app.get("/products/by-ean/:ean", async (req, res) => {
   const { ean } = req.params;
 
@@ -877,17 +841,26 @@ app.get("/products/by-ean/:ean", async (req, res) => {
     const { rows } = await pool.query(
       `
       SELECT
-        itemcode,
-        description_eng,
-        ean,
-        price,
-        available_stock,
-        outercarton,
-        innercarton,
-        unit
-      FROM products
-      WHERE ean = $1
-        AND ecommerce_available = true
+        p.itemcode,
+        p.description_eng,
+        p.ean,
+        p.price,
+        p.available_stock,
+        p.outercarton,
+        p.innercarton,
+        p.unit,
+        pic_main.url AS image_url
+      FROM products p
+      LEFT JOIN LATERAL (
+        SELECT pp.url
+        FROM product_pictures pp
+        WHERE pp.itemcode = p.itemcode
+          AND pp.url IS NOT NULL
+        ORDER BY COALESCE(pp.sort_order, 0) ASC, pp.picture_id ASC
+        LIMIT 1
+      ) pic_main ON TRUE
+      WHERE p.ean = $1
+        AND p.ecommerce_available = true
       LIMIT 1
       `,
       [ean]
@@ -957,10 +930,7 @@ app.post("/auth/login", async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      "SELECT * FROM agents WHERE agent_id = $1",
-      [agentId]
-    );
+    const result = await pool.query("SELECT * FROM agents WHERE agent_id = $1", [agentId]);
 
     if (result.rows.length === 0) {
       return res.status(401).json({ error: "Invalid credentials" });
@@ -972,11 +942,7 @@ app.post("/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const token = jwt.sign(
-      { agentId: agent.agent_id },
-      process.env.JWT_SECRET,
-      { expiresIn: "8h" }
-    );
+    const token = jwt.sign({ agentId: agent.agent_id }, process.env.JWT_SECRET, { expiresIn: "8h" });
 
     res.json({ token, agentId: agent.agent_id });
   } catch (err) {
@@ -1007,9 +973,7 @@ app.get("/debug/products/count", async (req, res) => {
 
 app.get("/debug/products/count-ecom", async (req, res) => {
   try {
-    const r = await pool.query(
-      "SELECT count(*) FROM products WHERE ecommerce_available = true"
-    );
+    const r = await pool.query("SELECT count(*) FROM products WHERE ecommerce_available = true");
     res.json({ count: Number(r.rows[0].count) });
   } catch (err) {
     console.error(err);
