@@ -557,14 +557,8 @@ app.post("/sync/pictures", async (req, res) => {
         const original_file = r[s.originalKey] ?? null;
         const location = r[s.locationKey] ?? null;
 
-        const pidSeed = [
-          String(itemcode),
-          s.kind,
-          original_file ? String(original_file) : "",
-          location ? String(location) : "",
-          b64.slice(0, 80),
-        ].join("|");
-        const picture_id = sha1(pidSeed);
+        const stableId = (original_file || location || `${itemcode}-${s.kind}`).toString()
+        const picture_id = sha1(stableId);
 
         await pool.query(
           `
@@ -933,23 +927,25 @@ app.get("/me", authMiddleware, (req, res) => {
 /* =======================
    DEBUG
    ======================= */
+
+// Products
 app.get("/debug/products/count", async (req, res) => {
   try {
     const r = await pool.query("SELECT count(*) FROM products");
-    res.json({ count: Number(r.rows[0].count) });
+    res.json({ ok: true, count: Number(r.rows[0].count) });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || "db error" });
+    console.error("debug/products/count:", err);
+    res.status(500).json({ ok: false, error: err.message || "db error" });
   }
 });
 
 app.get("/debug/products/count-ecom", async (req, res) => {
   try {
     const r = await pool.query("SELECT count(*) FROM products WHERE ecommerce_available = true");
-    res.json({ count: Number(r.rows[0].count) });
+    res.json({ ok: true, count: Number(r.rows[0].count) });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || "db error" });
+    console.error("debug/products/count-ecom:", err);
+    res.status(500).json({ ok: false, error: err.message || "db error" });
   }
 });
 
@@ -961,14 +957,14 @@ app.get("/debug/products/columns", async (req, res) => {
       WHERE table_name = 'products'
       ORDER BY ordinal_position
     `);
-    res.json(rows);
+    res.json({ ok: true, rows });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || "db error" });
+    console.error("debug/products/columns:", err);
+    res.status(500).json({ ok: false, error: err.message || "db error" });
   }
 });
 
-// ✅ nieuw: columns van product_pictures
+// Pictures
 app.get("/debug/pictures/columns", async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -977,20 +973,20 @@ app.get("/debug/pictures/columns", async (req, res) => {
       WHERE table_name = 'product_pictures'
       ORDER BY ordinal_position
     `);
-    res.json(rows);
+    res.json({ ok: true, rows });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || "db error" });
+    console.error("debug/pictures/columns:", err);
+    res.status(500).json({ ok: false, error: err.message || "db error" });
   }
 });
 
 app.get("/debug/pictures/count", async (req, res) => {
   try {
     const r = await pool.query("SELECT count(*) FROM product_pictures");
-    res.json({ count: Number(r.rows[0].count) });
+    res.json({ ok: true, count: Number(r.rows[0].count) });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || "db error" });
+    console.error("debug/pictures/count:", err);
+    res.status(500).json({ ok: false, error: err.message || "db error" });
   }
 });
 
@@ -998,30 +994,43 @@ app.get("/debug/pictures/count", async (req, res) => {
 app.get("/debug/pictures/sample", async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT itemcode, picture_id, kind,
-             CASE WHEN url IS NULL THEN NULL ELSE LEFT(url, 60) || '...' END AS url_preview,
-             filename, original_file, location,
-             sort_order, updated_at
+      SELECT
+        itemcode,
+        picture_id,
+        kind,
+        CASE WHEN url IS NULL THEN NULL ELSE LEFT(url, 60) || '...' END AS url_preview,
+        filename,
+        original_file,
+        location,
+        sort_order,
+        updated_at
       FROM product_pictures
       ORDER BY updated_at DESC
       LIMIT 10
     `);
-    res.json({ rows: r.rows });
+    res.json({ ok: true, rows: r.rows });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || "db error" });
+    console.error("debug/pictures/sample:", err);
+    res.status(500).json({ ok: false, error: err.message || "db error" });
   }
 });
 
 app.get("/debug/pictures/:itemcode", async (req, res) => {
   const { itemcode } = req.params;
+
   try {
     const r = await pool.query(
       `
-      SELECT itemcode, picture_id, kind,
-             CASE WHEN url IS NULL THEN NULL ELSE LEFT(url, 60) || '...' END AS url_preview,
-             filename, original_file, location,
-             sort_order, updated_at
+      SELECT
+        itemcode,
+        picture_id,
+        kind,
+        CASE WHEN url IS NULL THEN NULL ELSE LEFT(url, 60) || '...' END AS url_preview,
+        filename,
+        original_file,
+        location,
+        sort_order,
+        updated_at
       FROM product_pictures
       WHERE itemcode = $1
       ORDER BY
@@ -1031,13 +1040,15 @@ app.get("/debug/pictures/:itemcode", async (req, res) => {
       `,
       [itemcode]
     );
-    res.json({ itemcode, count: r.rows.length, rows: r.rows });
+
+    res.json({ ok: true, itemcode, count: r.rows.length, rows: r.rows });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || "db error" });
+    console.error("debug/pictures/:itemcode:", err);
+    res.status(500).json({ ok: false, error: err.message || "db error" });
   }
 });
 
+// AFAS pictures sample
 app.get("/debug/afas/pictures/sample", async (req, res) => {
   try {
     const connectorId = "Items_Pictures_app";
@@ -1051,9 +1062,26 @@ app.get("/debug/afas/pictures/sample", async (req, res) => {
       sample: row,
     });
   } catch (err) {
+    console.error("debug/afas/pictures/sample:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
+
+/* =======================
+   DB UTIL: reset pictures (one-time)
+   ======================= */
+app.post("/db/reset-pictures", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    await pool.query("TRUNCATE TABLE product_pictures;");
+    res.json({ ok: true, message: "product_pictures truncated" });
+  } catch (err) {
+    console.error("db/reset-pictures:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 
 /* =======================
    START SERVER
