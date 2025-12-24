@@ -348,23 +348,18 @@ app.post("/db/setup-afas-extra", async (req, res) => {
   }
 });
 
-// Migratie: maak pictures schema “future-proof” (voegt ook url/sort_order toe!)
-app.post("/db/migrate-pictures-v3", async (req, res) => {
+app.post("/db/migrate-pictures-v4", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   try {
     await pool.query(`
       ALTER TABLE product_pictures
         ADD COLUMN IF NOT EXISTS kind TEXT NULL,
-        ADD COLUMN IF NOT EXISTS url TEXT NULL,
         ADD COLUMN IF NOT EXISTS image_base64 TEXT NULL,
         ADD COLUMN IF NOT EXISTS mime TEXT NULL,
         ADD COLUMN IF NOT EXISTS filename TEXT NULL,
         ADD COLUMN IF NOT EXISTS original_file TEXT NULL,
-        ADD COLUMN IF NOT EXISTS location TEXT NULL,
-        ADD COLUMN IF NOT EXISTS sort_order INT NULL,
-        ADD COLUMN IF NOT EXISTS raw JSONB NULL,
-        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+        ADD COLUMN IF NOT EXISTS location TEXT NULL;
     `);
 
     await pool.query(`
@@ -372,9 +367,9 @@ app.post("/db/migrate-pictures-v3", async (req, res) => {
       ON product_pictures (itemcode, kind, sort_order, picture_id);
     `);
 
-    res.json({ ok: true, message: "product_pictures migrated to v3" });
+    res.json({ ok: true, message: "product_pictures migrated to v4" });
   } catch (err) {
-    console.error("migrate-pictures-v3:", err);
+    console.error("migrate-pictures-v4:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
