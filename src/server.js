@@ -1046,6 +1046,24 @@ app.get("/debug/pictures/:itemcode", async (req, res) => {
   }
 });
 
+app.get("/debug/afas/pictures/sample", async (req, res) => {
+  try {
+    const connectorId = "Items_Pictures_app";
+    const data = await fetchAfas(connectorId, { skip: 0, take: 1 });
+    const row = data?.rows?.[0] ?? null;
+
+    res.json({
+      ok: true,
+      connectorId,
+      keys: row ? Object.keys(row) : [],
+      sample: row,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+
 /* =======================
    START SERVER
    ======================= */
