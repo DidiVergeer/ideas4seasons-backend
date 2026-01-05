@@ -1,6 +1,8 @@
 // src/server.js
 /* eslint-disable no-console */
 
+"use strict";
+
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -18,6 +20,24 @@ const fetchFn =
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+/* =========================================================
+   CONFIG / ENV (names only)
+   =========================================================
+   DATABASE_URL
+   SETUP_KEY
+   JWT_SECRET
+
+   AFAS_ENV
+   AFAS_TOKEN_DATA
+   (optioneel) AFAS_TAKE_DEFAULT
+
+   R2_BUCKET
+   R2_ENDPOINT
+   R2_PUBLIC_BASE_URL
+   R2_ACCESS_KEY_ID
+   R2_SECRET_ACCESS_KEY
+   ========================================================= */
+
 /* =======================
    CORS
    ======================= */
@@ -31,14 +51,10 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Native apps / curl -> vaak geen Origin header
       if (!origin) return cb(null, true);
-
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-
       // Expo op LAN (bijv. http://192.168.x.x:8081)
       if (/^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:8081$/.test(origin)) return cb(null, true);
-
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -46,12 +62,10 @@ app.use(
     credentials: true,
   })
 );
-
-// Preflight
 app.options("*", cors());
 
-// JSON payload blijft laag (geen base64 in API)
-app.use(express.json({ limit: "5mb" }));
+// JSON payload laag houden (geen base64 in API)
+app.use(express.json({ limit: "2mb" }));
 
 /* =======================
    DATABASE
@@ -92,6 +106,8 @@ async function uploadToR2({ key, body, contentType }) {
       Key: key,
       Body: body,
       ContentType: contentType || "image/jpeg",
+      // (optioneel) cache headers, afhankelijk van je CDN setup:
+      // CacheControl: "public, max-age=31536000, immutable",
     })
   );
 
@@ -124,6 +140,11 @@ function parseBool(v) {
   return Boolean(v);
 }
 
+function getItemcodeFromRow(r) {
+  // Cruciaal: jouw AFAS levert soms alleen Code i.p.v. Itemcode
+  return r?.Itemcode ?? r?.itemcode ?? r?.Code ?? r?.code ?? null;
+}
+
 function guessMimeFromFilename(name) {
   if (!name) return null;
   const s = String(name).toLowerCase();
@@ -142,7 +163,6 @@ function normalizeBase64(v) {
   if (typeof v !== "string") return null;
   const s = v.trim();
   if (!s) return null;
-
   const idx = s.indexOf("base64,");
   if (idx >= 0) return s.slice(idx + "base64,".length).trim();
   return s;
@@ -162,6 +182,15 @@ function extFromMime(mime) {
   if (mime === "image/gif") return "gif";
   if (mime === "image/webp") return "webp";
   return "jpg";
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function jitter(ms, pct = 0.25) {
+  const delta = ms * pct;
+  return Math.max(0, Math.round(ms - delta + Math.random() * (2 * delta)));
 }
 
 /* =======================
@@ -184,12 +213,16 @@ function authMiddleware(req, res, next) {
 }
 
 /* =======================
-   AFAS HELPERS
+   AFAS HELPERS (robust)
    ======================= */
 function buildAfasAuthHeaderFromData(dataToken) {
   const xmlToken = `<token><version>1</version><data>${dataToken}</data></token>`;
   const b64 = Buffer.from(xmlToken, "utf8").toString("base64");
   return `AfasToken ${b64}`;
+}
+
+function isRetryableAfasStatus(status) {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
 async function fetchAfas(connectorId, { skip = 0, take = 100, extraQuery = "" } = {}) {
@@ -212,22 +245,56 @@ async function fetchAfas(connectorId, { skip = 0, take = 100, extraQuery = "" } 
   });
 
   const text = await res.text();
-  if (!res.ok) throw new Error(`AFAS ${res.status}: ${text}`);
+  if (!res.ok) {
+    const err = new Error(`AFAS ${res.status}: ${text}`);
+    err.status = res.status;
+    err.body = text;
+    err.url = url;
+    throw err;
+  }
 
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error(`AFAS invalid JSON: ${text}`);
+    const err = new Error(`AFAS invalid JSON: ${text}`);
+    err.url = url;
+    throw err;
   }
 }
 
-async function forEachAfasRow(connectorId, { take = 200 } = {}, onRow) {
+async function fetchAfasWithRetry(connectorId, opts = {}, retry = {}) {
+  const {
+    attempts = 6,
+    baseDelayMs = 500,
+    maxDelayMs = 8000,
+  } = retry;
+
+  let lastErr = null;
+
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fetchAfas(connectorId, opts);
+    } catch (e) {
+      lastErr = e;
+      const status = e?.status;
+      const retryable = status ? isRetryableAfasStatus(status) : true; // netwerk fouten => true
+      if (!retryable || i === attempts - 1) throw e;
+
+      const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, i));
+      await sleep(jitter(delay));
+    }
+  }
+
+  throw lastErr || new Error("AFAS fetch failed");
+}
+
+async function forEachAfasRow(connectorId, { take = 200, extraQuery = "" } = {}, onRow) {
   let skip = 0;
   let pages = 0;
   let totalRows = 0;
 
   while (true) {
-    const data = await fetchAfas(connectorId, { skip, take });
+    const data = await fetchAfasWithRetry(connectorId, { skip, take, extraQuery });
     const rows = data?.rows || [];
     if (rows.length === 0) break;
 
@@ -245,50 +312,35 @@ async function forEachAfasRow(connectorId, { take = 200 } = {}, onRow) {
 }
 
 /**
- * Probeer 1 AFAS row te pakken voor een itemcode.
- * Filtering kan verschillen per omgeving; daarom proberen we 2 varianten.
- */async function fetchAfasPicturesRowByItemcode(itemcode) {
+ * Stap 2: AFAS row ophalen per product.
+ * Proberen:
+ *  1) filter op Itemcode
+ *  2) filter op Code
+ *  met en zonder operatortypes=1
+ */
+async function fetchAfasPicturesRowByItemcode(itemcode) {
   const connectorId = "Items_Pictures_app";
   const encoded = encodeURIComponent(String(itemcode));
 
   const tries = [
-    // eerst Itemcode
     `&filterfieldids=Itemcode&filtervalues=${encoded}`,
     `&filterfieldids=Itemcode&filtervalues=${encoded}&operatortypes=1`,
-
-    // daarna Code (essentieel voor jouw AFAS setup)
     `&filterfieldids=Code&filtervalues=${encoded}`,
     `&filterfieldids=Code&filtervalues=${encoded}&operatortypes=1`,
   ];
 
   for (const extraQuery of tries) {
     try {
-      const data = await fetchAfas(connectorId, {
+      const data = await fetchAfasWithRetry(connectorId, {
         skip: 0,
         take: 1,
         extraQuery,
       });
-
       const row = data?.rows?.[0];
       if (row) return row;
     } catch (e) {
-      // negeren, volgende poging
+      // volgende poging
     }
-  }
-
-  return null;
-}
-
-  try {
-    const data = await fetchAfas(connectorId, {
-      skip: 0,
-      take: 1,
-      extraQuery: `&filterfieldids=Itemcode&filtervalues=${encoded}&operatortypes=1`,
-    });
-    const row = data?.rows?.[0];
-    if (row) return row;
-  } catch {
-    // ignore
   }
 
   return null;
@@ -435,13 +487,13 @@ app.post("/sync/products", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   const connectorId = req.query.connectorId || process.env.AFAS_CONNECTOR || "Items_Core";
-  const take = Number(req.query.take || 100);
+  const take = Number(req.query.take || process.env.AFAS_TAKE_DEFAULT || 100);
 
   let totalUpserted = 0;
 
   try {
     const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
-      const itemcode = r.Itemcode ?? r.itemcode ?? r.Code ?? r.code ?? null;
+      const itemcode = getItemcodeFromRow(r);
       if (!itemcode) return;
 
       const ecomBool = parseBool(r["E-commerce_beschikbaar"]);
@@ -500,12 +552,12 @@ app.post("/sync/categories", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   const connectorId = req.query.connectorId || "Items_Category_app";
-  const take = Number(req.query.take || 200);
+  const take = Number(req.query.take || process.env.AFAS_TAKE_DEFAULT || 200);
   let upserted = 0;
 
   try {
     const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
-      const itemcode = r.Itemcode ?? r.itemcode ?? null;
+      const itemcode = getItemcodeFromRow(r);
       if (!itemcode) return;
 
       const category_code = r.CategoryCode ?? r.Category ?? r.CategorieCode ?? r.Categorie ?? null;
@@ -538,12 +590,12 @@ app.post("/sync/descriptions", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   const connectorId = req.query.connectorId || "Items_Descriptions_app";
-  const take = Number(req.query.take || 200);
+  const take = Number(req.query.take || process.env.AFAS_TAKE_DEFAULT || 200);
   let upserted = 0;
 
   try {
     const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
-      const itemcode = r.Itemcode ?? r.itemcode ?? null;
+      const itemcode = getItemcodeFromRow(r);
       if (!itemcode) return;
 
       const langRaw = r.Language ?? r.Taal ?? r.Lang ?? "NL";
@@ -576,12 +628,12 @@ app.post("/sync/stock", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   const connectorId = req.query.connectorId || "Items_stock_app";
-  const take = Number(req.query.take || 200);
+  const take = Number(req.query.take || process.env.AFAS_TAKE_DEFAULT || 200);
   let upserted = 0;
 
   try {
     const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
-      const itemcode = r.Itemcode ?? r.itemcode ?? null;
+      const itemcode = getItemcodeFromRow(r);
       if (!itemcode) return;
 
       const warehouseRaw = r.Warehouse ?? r.Magazijn ?? r.WarehouseCode ?? null;
@@ -611,16 +663,17 @@ app.post("/sync/stock", async (req, res) => {
 });
 
 /* =======================
-   PICTURES: MANIFEST-ONLY SYNC (MAIN + SFEER_1..5)
+   PICTURES: STAP 1 MANIFEST SYNC (MAIN + SFEER_1..5)
    ======================= */
 app.post("/sync/pictures", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   const connectorId = req.query.connectorId || "Items_Pictures_app";
-  const take = Number(req.query.take || 200);
+  const take = Number(req.query.take || process.env.AFAS_TAKE_DEFAULT || 200);
 
   let rowsUpserted = 0;
   let picturesUpserted = 0;
+  let rowsSkippedNoItemcode = 0;
 
   const slots = [
     { kind: "MAIN", sort: 0, filenameKey: "Bestandsnaam_MAIN", originalKey: "Origineel_bestand_MAIN", locationKey: "Bestandslocatie_MAIN" },
@@ -633,15 +686,18 @@ app.post("/sync/pictures", async (req, res) => {
 
   try {
     const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
-      const itemcode = r.Itemcode ?? r.itemcode ?? null;
-      if (!itemcode) return;
+      const itemcode = getItemcodeFromRow(r);
+      if (!itemcode) {
+        rowsSkippedNoItemcode += 1;
+        return;
+      }
 
       let anyForRow = false;
 
       for (const s of slots) {
-        const filename = r[s.filenameKey] ?? null;
-        const original_file = r[s.originalKey] ?? null;
-        const location = r[s.locationKey] ?? null;
+        const filename = r?.[s.filenameKey] ?? null;
+        const original_file = r?.[s.originalKey] ?? null;
+        const location = r?.[s.locationKey] ?? null;
 
         if (!filename && !original_file && !location) continue;
 
@@ -700,6 +756,7 @@ app.post("/sync/pictures", async (req, res) => {
       rowsFetched: totalRows,
       upsertedRows: rowsUpserted,
       picturesUpserted,
+      rowsSkippedNoItemcode,
       note: "manifest-only (no base64). Use upload job to push to R2.",
     });
   } catch (err) {
@@ -709,7 +766,7 @@ app.post("/sync/pictures", async (req, res) => {
 });
 
 /* =======================
-   UPLOAD JOB: AFAS base64 -> R2 (MAIN + SFEER_1..5)
+   STAP 2 UPLOAD JOB: AFAS base64 -> R2
    ======================= */
 const KIND_TO_AFAS_B64_FIELD = {
   MAIN: "Afbeelding",
@@ -728,11 +785,53 @@ function parseKindsParam(kindsParam) {
     .filter(Boolean);
 }
 
-// POST /sync/upload-pictures-to-r2?key=...&limit=50&kinds=MAIN,SFEER_1
+// simpele concurrency helper (geen extra deps)
+async function runWithConcurrency(items, concurrency, handler) {
+  const results = [];
+  let idx = 0;
+
+  async function worker() {
+    while (true) {
+      const myIdx = idx++;
+      if (myIdx >= items.length) break;
+      results[myIdx] = await handler(items[myIdx], myIdx);
+    }
+  }
+
+  const workers = [];
+  const n = Math.max(1, Number(concurrency) || 1);
+  for (let i = 0; i < n; i++) workers.push(worker());
+  await Promise.all(workers);
+  return results;
+}
+
+async function uploadToR2WithRetry({ key, body, contentType }, retry = {}) {
+  const {
+    attempts = 5,
+    baseDelayMs = 500,
+    maxDelayMs = 8000,
+  } = retry;
+
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await uploadToR2({ key, body, contentType });
+    } catch (e) {
+      lastErr = e;
+      if (i === attempts - 1) throw e;
+      const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, i));
+      await sleep(jitter(delay));
+    }
+  }
+  throw lastErr || new Error("R2 upload failed");
+}
+
+// POST /sync/upload-pictures-to-r2?key=...&limit=50&kinds=MAIN,SFEER_1&concurrency=2
 app.post("/sync/upload-pictures-to-r2", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
-  const limit = Number(req.query.limit || 50);
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit || 50)));
+  const concurrency = Math.min(4, Math.max(1, Number(req.query.concurrency || 1))); // laag houden ivm Render/AFAS
   const kinds = parseKindsParam(req.query.kinds || "MAIN,SFEER_1,SFEER_2,SFEER_3,SFEER_4,SFEER_5");
 
   try {
@@ -754,68 +853,78 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
     let processed = 0;
     let skippedNoAfasRow = 0;
     let skippedNoB64 = 0;
+    let failed = 0;
 
-    for (const pic of rows) {
+    await runWithConcurrency(rows, concurrency, async (pic) => {
       const itemcode = pic.itemcode;
       const kind = String(pic.kind || "").toUpperCase();
       const b64Field = KIND_TO_AFAS_B64_FIELD[kind];
 
-      if (!b64Field) {
-        // onbekend kind -> markeer als done om endless loop te voorkomen
+      try {
+        if (!b64Field) {
+          await pool.query(
+            `UPDATE product_pictures SET needs_fetch = false, updated_at = NOW() WHERE itemcode=$1 AND picture_id=$2`,
+            [itemcode, pic.picture_id]
+          );
+          return;
+        }
+
+        const afasRow = await fetchAfasPicturesRowByItemcode(itemcode);
+        if (!afasRow) {
+          skippedNoAfasRow += 1;
+          return;
+        }
+
+        const b64 = normalizeBase64(afasRow[b64Field]);
+        if (!b64) {
+          skippedNoB64 += 1;
+          await pool.query(
+            `UPDATE product_pictures SET cdn_url = NULL, needs_fetch = false, updated_at = NOW() WHERE itemcode=$1 AND picture_id=$2`,
+            [itemcode, pic.picture_id]
+          );
+          return;
+        }
+
+        const mimeFromName = guessMimeFromFilename(pic.filename);
+        const mime = mimeFromName || guessMimeFromBase64(b64);
+        const ext = extFromMime(mime);
+
+        const buffer = Buffer.from(b64, "base64");
+        const key = `products/${itemcode}/${kind.toLowerCase()}.${ext}`;
+
+        const cdnUrl = await uploadToR2WithRetry({ key, body: buffer, contentType: mime });
+
         await pool.query(
-          `UPDATE product_pictures SET needs_fetch = false, updated_at = NOW() WHERE itemcode=$1 AND picture_id=$2`,
+          `
+          UPDATE product_pictures
+          SET cdn_url = $1, needs_fetch = false, updated_at = NOW()
+          WHERE itemcode = $2 AND picture_id = $3
+          `,
+          [cdnUrl, itemcode, pic.picture_id]
+        );
+
+        processed += 1;
+      } catch (e) {
+        failed += 1;
+        console.error("upload-pictures-to-r2 item failed:", { itemcode, kind, err: e?.message || String(e) });
+        // Belangrijk: laat needs_fetch true zodat job kan herstarten.
+        await pool.query(
+          `UPDATE product_pictures SET updated_at = NOW() WHERE itemcode=$1 AND picture_id=$2`,
           [itemcode, pic.picture_id]
         );
-        continue;
       }
-
-      const afasRow = await fetchAfasPicturesRowByItemcode(itemcode);
-      if (!afasRow) {
-        skippedNoAfasRow += 1;
-        continue;
-      }
-
-      const b64 = normalizeBase64(afasRow[b64Field]);
-      if (!b64) {
-        skippedNoB64 += 1;
-        // geen image in AFAS (meer) -> zet uit
-        await pool.query(
-          `UPDATE product_pictures SET cdn_url = NULL, needs_fetch = false, updated_at = NOW() WHERE itemcode=$1 AND picture_id=$2`,
-          [itemcode, pic.picture_id]
-        );
-        continue;
-      }
-
-      const mimeFromName = guessMimeFromFilename(pic.filename);
-      const mime = mimeFromName || guessMimeFromBase64(b64);
-      const ext = extFromMime(mime);
-
-      const buffer = Buffer.from(b64, "base64");
-
-      // Key structuur in R2 (stabiel)
-      const key = `products/${itemcode}/${kind.toLowerCase()}.${ext}`;
-      const cdnUrl = await uploadToR2({ key, body: buffer, contentType: mime });
-
-      await pool.query(
-        `
-        UPDATE product_pictures
-        SET cdn_url = $1, needs_fetch = false, updated_at = NOW()
-        WHERE itemcode = $2 AND picture_id = $3
-        `,
-        [cdnUrl, itemcode, pic.picture_id]
-      );
-
-      processed += 1;
-    }
+    });
 
     res.json({
       ok: true,
       kinds,
       limit,
+      concurrency,
       queued: rows.length,
       processed,
       skippedNoAfasRow,
       skippedNoB64,
+      failed,
     });
   } catch (err) {
     console.error("sync/upload-pictures-to-r2:", err);
@@ -862,8 +971,8 @@ app.get("/products", async (req, res) => {
   const take = req.query.take != null ? Number(req.query.take) : null;
   const skip = req.query.skip != null ? Number(req.query.skip) : null;
 
-  const limit = Number(req.query.limit) || take || 50;
-  const offset = Number(req.query.offset) || skip || 0;
+  const limit = Math.min(200, Number(req.query.limit) || take || 50);
+  const offset = Math.max(0, Number(req.query.offset) || skip || 0);
 
   try {
     const result = await queryProductsWithSafeImage(limit, offset);
@@ -1032,112 +1141,8 @@ app.get("/me", authMiddleware, (req, res) => {
 });
 
 /* =======================
-   DEBUG
+   DEBUG (licht)
    ======================= */
-app.get("/debug/pictures/sample", async (req, res) => {
-  try {
-    const r = await pool.query(`
-      SELECT
-        itemcode, picture_id, kind, cdn_url, needs_fetch,
-        filename, original_file, location, sort_order, updated_at
-      FROM product_pictures
-      ORDER BY updated_at DESC
-      LIMIT 10
-    `);
-    res.json({ ok: true, rows: r.rows });
-  } catch (err) {
-    console.error("debug/pictures/sample:", err);
-    res.status(500).json({ ok: false, error: err.message || "db error" });
-  }
-});
-
-app.get("/debug/afas/pictures/sample", async (req, res) => {
-  try {
-    const connectorId = "Items_Pictures_app";
-    const data = await fetchAfas(connectorId, { skip: 0, take: 1 });
-    const row = data?.rows?.[0] ?? null;
-
-    res.json({
-      ok: true,
-      connectorId,
-      keys: row ? Object.keys(row) : [],
-      sample: row,
-    });
-  } catch (err) {
-    console.error("debug/afas/pictures/sample:", err);
-    res.status(500).json({ ok: false, error: err.message || String(err) });
-  }
-});
-
-// Browser GET helpers (makkelijk testen)
-app.get("/debug/run-migrate-pictures-v5", async (req, res) => {
-  if (!requireSetupKey(req, res)) return;
-
-  try {
-    const internalUrl = `http://127.0.0.1:${PORT}/db/migrate-pictures-v5?key=${encodeURIComponent(req.query.key)}`;
-    const r = await fetchFn(internalUrl, { method: "POST" });
-    const text = await r.text();
-    res.status(r.status).type("application/json").send(text);
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message || String(err) });
-  }
-});
-
-app.get("/debug/run-sync-pictures", async (req, res) => {
-  if (!requireSetupKey(req, res)) return;
-
-  const take = Number(req.query.take || 200);
-
-  try {
-    const internalUrl = `http://127.0.0.1:${PORT}/sync/pictures?key=${encodeURIComponent(req.query.key)}&take=${take}`;
-    const r = await fetchFn(internalUrl, { method: "POST" });
-    const text = await r.text();
-    res.status(r.status).type("application/json").send(text);
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message || String(err) });
-  }
-});
-
-app.get("/debug/run-upload-pictures-to-r2", async (req, res) => {
-  if (!requireSetupKey(req, res)) return;
-
-  const limit = Number(req.query.limit || 25);
-  const kinds = req.query.kinds || "MAIN,SFEER_1"; // start klein, daarna uitbreiden
-
-  try {
-    const internalUrl =
-      `http://127.0.0.1:${PORT}/sync/upload-pictures-to-r2` +
-      `?key=${encodeURIComponent(req.query.key)}` +
-      `&limit=${encodeURIComponent(limit)}` +
-      `&kinds=${encodeURIComponent(kinds)}`;
-
-    const r = await fetchFn(internalUrl, { method: "POST" });
-    const text = await r.text();
-    res.status(r.status).type("application/json").send(text);
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message || String(err) });
-  }
-});
-
-// DEBUG counts
-app.get("/debug/images/counts", async (req, res) => {
-  try {
-    const a = await pool.query(`SELECT COUNT(*)::int AS n FROM products WHERE ecommerce_available = true`);
-    const b = await pool.query(`SELECT COUNT(*)::int AS n FROM product_pictures WHERE kind='MAIN'`);
-    const c = await pool.query(`SELECT COUNT(*)::int AS n FROM product_pictures WHERE kind='MAIN' AND cdn_url IS NOT NULL`);
-    const d = await pool.query(`SELECT COUNT(*)::int AS n FROM product_pictures WHERE kind='MAIN' AND cdn_url IS NULL`);
-    res.json({
-      ok: true,
-      ecommerce_products: a.rows[0].n,
-      main_records_total: b.rows[0].n,
-      main_with_cdn: c.rows[0].n,
-      main_missing_cdn: d.rows[0].n,
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 app.get("/debug/pictures/db-counts", async (req, res) => {
   try {
     const a = await pool.query(`
@@ -1170,10 +1175,52 @@ app.get("/debug/pictures/db-counts", async (req, res) => {
   }
 });
 
+app.get("/debug/pictures/sample", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT
+        itemcode, picture_id, kind, cdn_url, needs_fetch,
+        filename, original_file, location, sort_order, updated_at
+      FROM product_pictures
+      ORDER BY updated_at DESC
+      LIMIT 10
+    `);
+    res.json({ ok: true, rows: r.rows });
+  } catch (err) {
+    console.error("debug/pictures/sample:", err);
+    res.status(500).json({ ok: false, error: err.message || "db error" });
+  }
+});
 
 /* =======================
-   START SERVER
+   ERROR HANDLER
    ======================= */
-app.listen(PORT, () => {
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ ok: false, error: err?.message || String(err) });
+});
+
+/* =======================
+   START SERVER + GRACEFUL SHUTDOWN
+   ======================= */
+const server = app.listen(PORT, () => {
   console.log(`API running on port ${PORT}`);
 });
+
+async function shutdown(signal) {
+  console.log(`Received ${signal}. Shutting down...`);
+  server.close(async () => {
+    try {
+      await pool.end();
+    } catch (e) {
+      console.error("Error closing pool:", e);
+    }
+    process.exit(0);
+  });
+
+  // Force exit if hanging
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
