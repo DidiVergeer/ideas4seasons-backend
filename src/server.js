@@ -1351,26 +1351,20 @@ app.get("/debug/afas/pictures/lookup", async (req, res) => {
       const row = data?.rows?.[0] ?? null;
 
       results.push({
-        try: t.label,
-        found: !!row,
-        hasMainFields: row
-          ? Boolean(row.Bestandsnaam_MAIN || row.Origineel_bestand_MAIN || row.Bestandslocatie_MAIN)
-          : false,
-        keys: row ? Object.keys(row) : [],
-      });
-    } catch (e) {
-      results.push({
-        try: t.label,
-        error: e.message,
-      });
-    }
-  }
-
-  res.json({
-    ok: true,
-    itemcode,
-    results,
-  });
+  try: t.label,
+  found: !!row,
+  hasMainFields: row
+    ? Boolean(row.Bestandsnaam_MAIN || row.Origineel_bestand_MAIN || row.Bestandslocatie_MAIN)
+    : false,
+  mainMeta: row
+    ? {
+        Bestandsnaam_MAIN: row.Bestandsnaam_MAIN ?? null,
+        Origineel_bestand_MAIN: row.Origineel_bestand_MAIN ?? null,
+        Bestandslocatie_MAIN: row.Bestandslocatie_MAIN ?? null,
+        Itemcode: row.Itemcode ?? row.itemcode ?? null,
+        Code: row.Code ?? row.code ?? null,
+      }
+    : null,
 });
 
 
