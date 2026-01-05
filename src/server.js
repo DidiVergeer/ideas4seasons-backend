@@ -1123,46 +1123,34 @@ app.get("/debug/images/counts", async (req, res) => {
   }
 });
 
-app.get("/debug/afas/pictures/counts", async (req, res) => {
+app.get("/debug/pictures/db-counts", async (req, res) => {
   try {
-    const take = Math.min(1000, Math.max(1, Number(req.query.take || 200))); // max 1000
-    const connectorId = "Items_Pictures_app";
+    const a = await pool.query(`
+      SELECT COUNT(*)::int AS ecommerce_products
+      FROM products
+      WHERE ecommerce_available = true
+    `);
 
-    const data = await fetchAfas(connectorId, { skip: 0, take });
-    const rows = data?.rows || [];
+    const b = await pool.query(`
+      SELECT
+        COUNT(*)::int AS main_records_total,
+        COUNT(*) FILTER (WHERE cdn_url IS NOT NULL)::int AS main_with_cdn,
+        COUNT(*) FILTER (WHERE cdn_url IS NULL)::int AS main_missing_cdn
+      FROM product_pictures
+      WHERE kind = 'MAIN'
+    `);
 
-    let totalRows = rows.length;
-    let rowsWithItemcode = 0;
-    let rowsWithCode = 0;
+    const c = await pool.query(`
+      SELECT COUNT(*)::int AS ecommerce_missing_main_record
+      FROM products p
+      LEFT JOIN product_pictures pp
+        ON pp.itemcode = p.itemcode AND pp.kind = 'MAIN'
+      WHERE p.ecommerce_available = true
+        AND pp.itemcode IS NULL
+    `);
 
-    const metaCounts = { MAIN: 0, SFEER_1: 0, SFEER_2: 0, SFEER_3: 0, SFEER_4: 0, SFEER_5: 0 };
-
-    const hasMeta = (fn, of, loc) => Boolean(fn || of || loc);
-
-    for (const r of rows) {
-      if (r.Itemcode || r.itemcode) rowsWithItemcode += 1;
-      if (r.Code || r.code) rowsWithCode += 1;
-
-      if (hasMeta(r.Bestandsnaam_MAIN, r.Origineel_bestand_MAIN, r.Bestandslocatie_MAIN)) metaCounts.MAIN += 1;
-      if (hasMeta(r.Bestandsnaam_SFEER_1, r.Origineel_bestand_SFEER_1, r.Bestandslocatie_SFEER_1)) metaCounts.SFEER_1 += 1;
-      if (hasMeta(r.Bestandsnaam_SFEER_2, r.Origineel_bestand_SFEER_2, r.Bestandslocatie_SFEER_2)) metaCounts.SFEER_2 += 1;
-      if (hasMeta(r.Bestandsnaam_SFEER_3, r.Origineel_bestand_SFEER_3, r.Bestandslocatie_SFEER_3)) metaCounts.SFEER_3 += 1;
-      if (hasMeta(r.Bestandsnaam_SFEER_4, r.Origineel_bestand_SFEER_4, r.Bestandslocatie_SFEER_4)) metaCounts.SFEER_4 += 1;
-      if (hasMeta(r.Bestandsnaam_SFEER_5, r.Origineel_bestand_SFEER_5, r.Bestandslocatie_SFEER_5)) metaCounts.SFEER_5 += 1;
-    }
-
-    res.json({
-      ok: true,
-      connectorId,
-      sampled: true,
-      take,
-      totalRows,
-      rowsWithItemcode,
-      rowsWithCode,
-      metaCounts,
-    });
+    res.json({ ok: true, ...a.rows[0], ...b.rows[0], ...c.rows[0] });
   } catch (err) {
-    console.error("debug/afas/pictures/counts:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
