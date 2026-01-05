@@ -106,7 +106,6 @@ async function uploadToR2({ key, body, contentType }) {
       Key: key,
       Body: body,
       ContentType: contentType || "image/jpeg",
-      // (optioneel) cache headers, afhankelijk van je CDN setup:
       // CacheControl: "public, max-age=31536000, immutable",
     })
   );
@@ -263,11 +262,7 @@ async function fetchAfas(connectorId, { skip = 0, take = 100, extraQuery = "" } 
 }
 
 async function fetchAfasWithRetry(connectorId, opts = {}, retry = {}) {
-  const {
-    attempts = 6,
-    baseDelayMs = 500,
-    maxDelayMs = 8000,
-  } = retry;
+  const { attempts = 6, baseDelayMs = 500, maxDelayMs = 8000 } = retry;
 
   let lastErr = null;
 
@@ -338,12 +333,66 @@ async function fetchAfasPicturesRowByItemcode(itemcode) {
       });
       const row = data?.rows?.[0];
       if (row) return row;
-    } catch (e) {
+    } catch {
       // volgende poging
     }
   }
 
   return null;
+}
+
+/* =========================================================
+   MAIN manifest upsert helper (product-gedreven)
+   ========================================================= */
+async function upsertMainPictureManifest(itemcode, afasRow) {
+  const filename = afasRow?.Bestandsnaam_MAIN ?? null;
+  const original_file = afasRow?.Origineel_bestand_MAIN ?? null;
+  const location = afasRow?.Bestandslocatie_MAIN ?? null;
+
+  if (!filename && !original_file && !location) {
+    return { didUpsert: false, reason: "no_main_fields" };
+  }
+
+  const mime = guessMimeFromFilename(filename);
+  const stableId = String(original_file || location || `${itemcode}-MAIN`);
+  const picture_id = sha1(stableId);
+
+  await pool.query(
+    `
+    INSERT INTO product_pictures (
+      itemcode, picture_id, kind,
+      cdn_url, mime, filename, original_file, location,
+      needs_fetch, sort_order, raw, updated_at
+    )
+    VALUES ($1,$2,'MAIN', NULL,$3,$4,$5,$6, true,0,$7,NOW())
+    ON CONFLICT (itemcode, picture_id) DO UPDATE SET
+      kind = 'MAIN',
+      mime = EXCLUDED.mime,
+      filename = EXCLUDED.filename,
+      original_file = EXCLUDED.original_file,
+      location = EXCLUDED.location,
+      sort_order = 0,
+      raw = EXCLUDED.raw,
+      updated_at = NOW(),
+      needs_fetch =
+        (product_pictures.original_file IS DISTINCT FROM EXCLUDED.original_file)
+        OR (product_pictures.location IS DISTINCT FROM EXCLUDED.location)
+        OR (product_pictures.filename IS DISTINCT FROM EXCLUDED.filename)
+        OR (product_pictures.mime IS DISTINCT FROM EXCLUDED.mime)
+        OR (product_pictures.cdn_url IS NULL)
+    `,
+    [
+      String(itemcode),
+      String(picture_id),
+      mime,
+      filename ? String(filename) : null,
+      original_file ? String(original_file) : null,
+      location ? String(location) : null,
+      afasRow,
+    ]
+  );
+
+  return { didUpsert: true };
 }
 
 /* =======================
@@ -663,7 +712,7 @@ app.post("/sync/stock", async (req, res) => {
 });
 
 /* =======================
-   PICTURES: STAP 1 MANIFEST SYNC (MAIN + SFEER_1..5)
+   PICTURES: STAP 1 MANIFEST SYNC (bulk; handig voor SFEER)
    ======================= */
 app.post("/sync/pictures", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
@@ -757,10 +806,72 @@ app.post("/sync/pictures", async (req, res) => {
       upsertedRows: rowsUpserted,
       picturesUpserted,
       rowsSkippedNoItemcode,
-      note: "manifest-only (no base64). Use upload job to push to R2.",
+      note: "manifest-only (bulk). For MAIN completeness use /sync/pictures-main-from-products.",
     });
   } catch (err) {
     console.error("sync/pictures:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+/* =========================================================
+   NEW: MAIN manifest rebuild from products (DE KERNFIX)
+   POST /sync/pictures-main-from-products?key=...&limit=100&offset=0
+   ========================================================= */
+app.post("/sync/pictures-main-from-products", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit || 100)));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+
+  try {
+    const pr = await pool.query(
+      `
+      SELECT itemcode
+      FROM products
+      WHERE ecommerce_available = true
+      ORDER BY itemcode
+      LIMIT $1 OFFSET $2
+      `,
+      [limit, offset]
+    );
+
+    let processed = 0;
+    let foundAfasRow = 0;
+    let upserted = 0;
+    let missingInAfas = 0;
+    let noMainFields = 0;
+
+    for (const p of pr.rows) {
+      const itemcode = p.itemcode;
+      processed += 1;
+
+      const afasRow = await fetchAfasPicturesRowByItemcode(itemcode);
+      if (!afasRow) {
+        missingInAfas += 1;
+        continue;
+      }
+
+      foundAfasRow += 1;
+
+      const r = await upsertMainPictureManifest(itemcode, afasRow);
+      if (r.didUpsert) upserted += 1;
+      else if (r.reason === "no_main_fields") noMainFields += 1;
+    }
+
+    res.json({
+      ok: true,
+      limit,
+      offset,
+      processed,
+      foundAfasRow,
+      upserted,
+      missingInAfas,
+      noMainFields,
+      note: "MAIN manifest rebuilt from products batch (guarantees coverage).",
+    });
+  } catch (err) {
+    console.error("sync/pictures-main-from-products:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
@@ -806,11 +917,7 @@ async function runWithConcurrency(items, concurrency, handler) {
 }
 
 async function uploadToR2WithRetry({ key, body, contentType }, retry = {}) {
-  const {
-    attempts = 5,
-    baseDelayMs = 500,
-    maxDelayMs = 8000,
-  } = retry;
+  const { attempts = 5, baseDelayMs = 500, maxDelayMs = 8000 } = retry;
 
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
@@ -826,7 +933,7 @@ async function uploadToR2WithRetry({ key, body, contentType }, retry = {}) {
   throw lastErr || new Error("R2 upload failed");
 }
 
-// POST /sync/upload-pictures-to-r2?key=...&limit=50&kinds=MAIN,SFEER_1&concurrency=2
+// POST /sync/upload-pictures-to-r2?key=...&limit=50&kinds=MAIN&concurrency=1
 app.post("/sync/upload-pictures-to-r2", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
@@ -906,12 +1013,16 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
         processed += 1;
       } catch (e) {
         failed += 1;
-        console.error("upload-pictures-to-r2 item failed:", { itemcode, kind, err: e?.message || String(e) });
-        // Belangrijk: laat needs_fetch true zodat job kan herstarten.
-        await pool.query(
-          `UPDATE product_pictures SET updated_at = NOW() WHERE itemcode=$1 AND picture_id=$2`,
-          [itemcode, pic.picture_id]
-        );
+        console.error("upload-pictures-to-r2 item failed:", {
+          itemcode,
+          kind,
+          err: e?.message || String(e),
+        });
+        // needs_fetch blijft true -> herstartbaar
+        await pool.query(`UPDATE product_pictures SET updated_at = NOW() WHERE itemcode=$1 AND picture_id=$2`, [
+          itemcode,
+          pic.picture_id,
+        ]);
       }
     });
 
