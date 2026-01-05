@@ -896,6 +896,37 @@ app.get("/debug/afas/pictures/sample", async (req, res) => {
   }
 });
 
+// ✅ Browser GET -> run POST /db/migrate-pictures-v5
+app.get("/debug/run-migrate-pictures-v5", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    const internalUrl = `http://127.0.0.1:${PORT}/db/migrate-pictures-v5?key=${encodeURIComponent(req.query.key)}`;
+    const r = await fetchFn(internalUrl, { method: "POST" });
+    const text = await r.text();
+    res.status(r.status).type("application/json").send(text);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+// ✅ Browser GET -> run POST /sync/pictures
+app.get("/debug/run-sync-pictures", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const take = Number(req.query.take || 200);
+
+  try {
+    const internalUrl = `http://127.0.0.1:${PORT}/sync/pictures?key=${encodeURIComponent(req.query.key)}&take=${take}`;
+    const r = await fetchFn(internalUrl, { method: "POST" });
+    const text = await r.text();
+    res.status(r.status).type("application/json").send(text);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+
 /* =======================
    DB UTIL: reset pictures
    ======================= */
