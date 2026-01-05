@@ -947,6 +947,43 @@ app.get("/debug/products/raw-main", async (req, res) => {
   res.json({ ok: true, row: r.rows[0] || null });
 });
 
+// DEBUG: inspecteer pictures + raw MAIN meta voor 1 item (NO base64)
+app.get("/debug/pictures/inspect", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const itemcode = String(req.query.itemcode || "").trim();
+  if (!itemcode) return res.status(400).json({ ok: false, error: "itemcode required" });
+
+  try {
+    const p = await pool.query(
+      `SELECT itemcode, ecommerce_available,
+              raw->>'Bestandsnaam_MAIN' AS bestandsnaam_main,
+              raw->>'Origineel_bestand_MAIN' AS origineel_bestand_main,
+              raw->>'Bestandslocatie_MAIN' AS bestandslocatie_main
+       FROM products
+       WHERE itemcode = $1
+       LIMIT 1`,
+      [itemcode]
+    );
+
+    const pics = await pool.query(
+      `SELECT itemcode, kind, picture_id, filename, original_file, location, mime, cdn_url, needs_fetch, updated_at
+       FROM product_pictures
+       WHERE itemcode = $1
+       ORDER BY kind, sort_order, picture_id`,
+      [itemcode]
+    );
+
+    res.json({
+      ok: true,
+      product: p.rows[0] || null,
+      pictures: pics.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 
 /* =========================================================
    Error handler
