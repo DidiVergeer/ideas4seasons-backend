@@ -1104,6 +1104,26 @@ app.get("/debug/run-upload-pictures-to-r2", async (req, res) => {
   }
 });
 
+// DEBUG counts
+app.get("/debug/images/counts", async (req, res) => {
+  try {
+    const a = await pool.query(`SELECT COUNT(*)::int AS n FROM products WHERE ecommerce_available = true`);
+    const b = await pool.query(`SELECT COUNT(*)::int AS n FROM product_pictures WHERE kind='MAIN'`);
+    const c = await pool.query(`SELECT COUNT(*)::int AS n FROM product_pictures WHERE kind='MAIN' AND cdn_url IS NOT NULL`);
+    const d = await pool.query(`SELECT COUNT(*)::int AS n FROM product_pictures WHERE kind='MAIN' AND cdn_url IS NULL`);
+    res.json({
+      ok: true,
+      ecommerce_products: a.rows[0].n,
+      main_records_total: b.rows[0].n,
+      main_with_cdn: c.rows[0].n,
+      main_missing_cdn: d.rows[0].n,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 /* =======================
    START SERVER
    ======================= */
