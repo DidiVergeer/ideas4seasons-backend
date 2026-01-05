@@ -965,6 +965,26 @@ app.get("/debug/afas/pictures/lookup", async (req, res) => {
   res.json({ ok: true, itemcode, results });
 });
 
+// DEBUG: welke MAIN records hebben geen cdn_url?
+app.get("/debug/pictures/missing-cdn-main", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    const r = await pool.query(`
+      SELECT itemcode, picture_id, filename, original_file, location, needs_fetch, updated_at
+      FROM product_pictures
+      WHERE kind = 'MAIN'
+        AND cdn_url IS NULL
+      ORDER BY updated_at ASC
+      LIMIT 50
+    `);
+
+    res.json({ ok: true, count: r.rows.length, rows: r.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 
 /* =========================================================
    Error handler
