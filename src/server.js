@@ -1,9 +1,6 @@
 // src/server.js
-<<<<<<< HEAD
-=======
 /* eslint-disable no-console */
 
->>>>>>> f6aa902bde13cfb5cd1f7c1709486e1cffa5db58
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -24,11 +21,6 @@ const PORT = process.env.PORT || 3000;
 /* =======================
    CORS
    ======================= */
-<<<<<<< HEAD
-
-// ✅ voeg Expo Web origins toe (8081)
-=======
->>>>>>> f6aa902bde13cfb5cd1f7c1709486e1cffa5db58
 const ALLOWED_ORIGINS = [
   "http://localhost:3000",
   "http://localhost:8081",
@@ -36,24 +28,17 @@ const ALLOWED_ORIGINS = [
   "https://ideas4seasons-frontend.onrender.com",
 ];
 
-<<<<<<< HEAD
-// ✅ Gebruik function origin check (mobiel/native requests hebben vaak geen Origin header)
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Geen origin? (bijv. native apps / curl) → toestaan
+      // Native apps / curl -> vaak geen Origin header
       if (!origin) return cb(null, true);
 
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
 
-=======
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      // Expo op LAN (bijv. http://192.168.x.x:8081)
       if (/^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:8081$/.test(origin)) return cb(null, true);
->>>>>>> f6aa902bde13cfb5cd1f7c1709486e1cffa5db58
+
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -62,15 +47,11 @@ app.use(
   })
 );
 
-<<<<<<< HEAD
-// ✅ Preflight netjes afhandelen
+// Preflight
 app.options("*", cors());
 
-app.use(express.json());
-=======
-// ✅ base64 is eruit -> json kan weer laag
+// JSON payload blijft laag (geen base64 in API)
 app.use(express.json({ limit: "5mb" }));
->>>>>>> f6aa902bde13cfb5cd1f7c1709486e1cffa5db58
 
 /* =======================
    DATABASE
@@ -265,13 +246,12 @@ async function forEachAfasRow(connectorId, { take = 200 } = {}, onRow) {
 
 /**
  * Probeer 1 AFAS row te pakken voor een itemcode.
- * AFAS filtering kan per omgeving verschillen; we proberen 2 varianten.
+ * Filtering kan verschillen per omgeving; daarom proberen we 2 varianten.
  */
 async function fetchAfasPicturesRowByItemcode(itemcode) {
   const connectorId = "Items_Pictures_app";
   const encoded = encodeURIComponent(String(itemcode));
 
-  // Variant A: alleen filterfieldids/filtervalues
   try {
     const data = await fetchAfas(connectorId, {
       skip: 0,
@@ -280,11 +260,10 @@ async function fetchAfasPicturesRowByItemcode(itemcode) {
     });
     const row = data?.rows?.[0];
     if (row) return row;
-  } catch (e) {
-    // ignore; probeer variant B
+  } catch {
+    // ignore
   }
 
-  // Variant B: met operatortypes=1 (equals) (wordt in sommige omgevingen verwacht)
   try {
     const data = await fetchAfas(connectorId, {
       skip: 0,
@@ -293,7 +272,7 @@ async function fetchAfasPicturesRowByItemcode(itemcode) {
     });
     const row = data?.rows?.[0];
     if (row) return row;
-  } catch (e) {
+  } catch {
     // ignore
   }
 
@@ -365,56 +344,6 @@ app.post("/db/setup-afas-extra", async (req, res) => {
       );
     `);
 
-<<<<<<< HEAD
-        const ecomRaw = r["E-commerce_beschikbaar"] ?? null;
-        const ecomBool = ecomRaw === "Ja";
-
-        await pool.query(
-          `
-          INSERT INTO products (
-            itemcode,
-            type_item,
-            description_eng,
-            unit,
-            price,
-            outercarton,
-            innercarton,
-            ean,
-            available_stock,
-            ecommerce_available,
-            raw,
-            updated_at
-          ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW()
-          )
-          ON CONFLICT (itemcode) DO UPDATE SET
-            type_item = EXCLUDED.type_item,
-            description_eng = EXCLUDED.description_eng,
-            unit = EXCLUDED.unit,
-            price = EXCLUDED.price,
-            outercarton = EXCLUDED.outercarton,
-            innercarton = EXCLUDED.innercarton,
-            ean = EXCLUDED.ean,
-            available_stock = EXCLUDED.available_stock,
-            ecommerce_available = EXCLUDED.ecommerce_available,
-            raw = EXCLUDED.raw,
-            updated_at = NOW()
-          `,
-          [
-            itemcode,
-            r.Type_item ?? null,
-            r.OMSCHRIJVING_ENG ?? null,
-            r.UNIT ?? null,
-            r.Prijs ?? null,
-            r.OUTERCARTON ?? null,
-            r.INNERCARTON ?? null,
-            r["EAN_product__Opgeschoonde_barcode_"] ?? null,
-            r.Beschikbare_voorraad ?? null,
-            ecomBool,
-            r,
-          ]
-        );
-=======
     await pool.query(`
       CREATE TABLE IF NOT EXISTS product_pictures (
         itemcode TEXT NOT NULL,
@@ -426,7 +355,6 @@ app.post("/db/setup-afas-extra", async (req, res) => {
         filename TEXT NULL,
         original_file TEXT NULL,
         location TEXT NULL,
->>>>>>> f6aa902bde13cfb5cd1f7c1709486e1cffa5db58
 
         needs_fetch BOOLEAN NOT NULL DEFAULT true,
         sort_order INT NULL,
@@ -478,7 +406,7 @@ app.post("/db/migrate-pictures-v5", async (req, res) => {
       ON product_pictures (itemcode, kind, sort_order, picture_id);
     `);
 
-    res.json({ ok: true, message: "product_pictures migrated to v5 (manifest + cdn_url + needs_fetch)" });
+    res.json({ ok: true, message: "product_pictures migrated to v5" });
   } catch (err) {
     console.error("migrate-pictures-v5:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
@@ -486,7 +414,7 @@ app.post("/db/migrate-pictures-v5", async (req, res) => {
 });
 
 /* =======================
-   SYNC PRODUCTS
+   SYNC: PRODUCTS
    ======================= */
 app.post("/sync/products", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
@@ -668,7 +596,7 @@ app.post("/sync/stock", async (req, res) => {
 });
 
 /* =======================
-   ✅ PICTURES: MANIFEST-ONLY SYNC
+   PICTURES: MANIFEST-ONLY SYNC (MAIN + SFEER_1..5)
    ======================= */
 app.post("/sync/pictures", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
@@ -703,7 +631,6 @@ app.post("/sync/pictures", async (req, res) => {
         if (!filename && !original_file && !location) continue;
 
         const mime = guessMimeFromFilename(filename);
-
         const stableId = String(original_file || location || `${itemcode}-${s.kind}`);
         const picture_id = sha1(stableId);
 
@@ -767,7 +694,7 @@ app.post("/sync/pictures", async (req, res) => {
 });
 
 /* =======================
-   ✅ UPLOAD JOB: AFAS base64 -> R2 (MAIN + SFEER)
+   UPLOAD JOB: AFAS base64 -> R2 (MAIN + SFEER_1..5)
    ======================= */
 const KIND_TO_AFAS_B64_FIELD = {
   MAIN: "Afbeelding",
@@ -779,7 +706,7 @@ const KIND_TO_AFAS_B64_FIELD = {
 };
 
 function parseKindsParam(kindsParam) {
-  if (!kindsParam) return ["MAIN"]; // default
+  if (!kindsParam) return ["MAIN"];
   return String(kindsParam)
     .split(",")
     .map((s) => s.trim().toUpperCase())
@@ -844,14 +771,13 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
         continue;
       }
 
-      // mime + ext
       const mimeFromName = guessMimeFromFilename(pic.filename);
       const mime = mimeFromName || guessMimeFromBase64(b64);
       const ext = extFromMime(mime);
 
       const buffer = Buffer.from(b64, "base64");
 
-      // Key structuur in R2
+      // Key structuur in R2 (stabiel)
       const key = `products/${itemcode}/${kind.toLowerCase()}.${ext}`;
       const cdnUrl = await uploadToR2({ key, body: buffer, contentType: mime });
 
@@ -884,14 +810,7 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
 
 /* =======================
    PRODUCTS API
-   ✅ image_url komt nu alleen uit cdn_url
    ======================= */
-
-<<<<<<< HEAD
-// GET /products?limit=50&offset=0
-// ✅ Ook: /products?take=50&skip=0 (alias)
-// ✅ Optioneel: &array=1 -> return alleen de array (handig voor Expo client)
-=======
 async function queryProductsWithSafeImage(limit, offset) {
   const q = `
     SELECT
@@ -924,7 +843,6 @@ async function queryProductsWithSafeImage(limit, offset) {
   return { rows };
 }
 
->>>>>>> f6aa902bde13cfb5cd1f7c1709486e1cffa5db58
 app.get("/products", async (req, res) => {
   const take = req.query.take != null ? Number(req.query.take) : null;
   const skip = req.query.skip != null ? Number(req.query.skip) : null;
@@ -932,25 +850,7 @@ app.get("/products", async (req, res) => {
   const limit = Number(req.query.limit) || take || 50;
   const offset = Number(req.query.offset) || skip || 0;
 
-  const asArray = String(req.query.array || "") === "1";
-
   try {
-<<<<<<< HEAD
-    const { rows } = await pool.query(
-      `
-      SELECT itemcode, description_eng, ean, price, available_stock
-      FROM products
-      WHERE ecommerce_available = true
-      ORDER BY itemcode
-      LIMIT $1 OFFSET $2
-      `,
-      [limit, offset]
-    );
-
-    if (asArray) return res.json(rows);
-
-    res.json({ ok: true, limit, offset, count: rows.length, data: rows });
-=======
     const result = await queryProductsWithSafeImage(limit, offset);
     res.json({
       ok: true,
@@ -959,7 +859,6 @@ app.get("/products", async (req, res) => {
       count: result.rows.length,
       data: result.rows,
     });
->>>>>>> f6aa902bde13cfb5cd1f7c1709486e1cffa5db58
   } catch (err) {
     console.error("GET /products DB error:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
@@ -1098,32 +997,12 @@ app.post("/auth/login", async (req, res) => {
   if (!agentId || !pin) return res.status(400).json({ error: "agentId and pin required" });
 
   try {
-<<<<<<< HEAD
-    const result = await pool.query("SELECT * FROM agents WHERE agent_id = $1", [
-      agentId,
-    ]);
-
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
-
-    const agent = result.rows[0];
-    const isValid = await bcrypt.compare(pin, agent.pin_hash);
-    if (!isValid) {
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
-
-    const token = jwt.sign({ agentId: agent.agent_id }, process.env.JWT_SECRET, {
-      expiresIn: "8h",
-    });
-=======
     const result = await pool.query("SELECT * FROM agents WHERE agent_id = $1", [agentId]);
     if (result.rows.length === 0) return res.status(401).json({ error: "Invalid credentials" });
 
     const agent = result.rows[0];
     const isValid = await bcrypt.compare(pin, agent.pin_hash);
     if (!isValid) return res.status(401).json({ error: "Invalid credentials" });
->>>>>>> f6aa902bde13cfb5cd1f7c1709486e1cffa5db58
 
     const token = jwt.sign({ agentId: agent.agent_id }, process.env.JWT_SECRET, { expiresIn: "8h" });
     res.json({ token, agentId: agent.agent_id });
@@ -1138,7 +1017,7 @@ app.get("/me", authMiddleware, (req, res) => {
 });
 
 /* =======================
-   DEBUG (browser checks)
+   DEBUG
    ======================= */
 app.get("/debug/pictures/sample", async (req, res) => {
   try {
@@ -1204,12 +1083,11 @@ app.get("/debug/run-sync-pictures", async (req, res) => {
   }
 });
 
-// ✅ Browser GET -> upload job
 app.get("/debug/run-upload-pictures-to-r2", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   const limit = Number(req.query.limit || 25);
-  const kinds = req.query.kinds || "MAIN"; // start klein; je kunt ook ALLES meegeven
+  const kinds = req.query.kinds || "MAIN,SFEER_1"; // start klein, daarna uitbreiden
 
   try {
     const internalUrl =
