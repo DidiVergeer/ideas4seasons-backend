@@ -247,22 +247,37 @@ async function forEachAfasRow(connectorId, { take = 200 } = {}, onRow) {
 /**
  * Probeer 1 AFAS row te pakken voor een itemcode.
  * Filtering kan verschillen per omgeving; daarom proberen we 2 varianten.
- */
-async function fetchAfasPicturesRowByItemcode(itemcode) {
+ */async function fetchAfasPicturesRowByItemcode(itemcode) {
   const connectorId = "Items_Pictures_app";
   const encoded = encodeURIComponent(String(itemcode));
 
-  try {
-    const data = await fetchAfas(connectorId, {
-      skip: 0,
-      take: 1,
-      extraQuery: `&filterfieldids=Itemcode&filtervalues=${encoded}`,
-    });
-    const row = data?.rows?.[0];
-    if (row) return row;
-  } catch {
-    // ignore
+  const tries = [
+    // eerst Itemcode
+    `&filterfieldids=Itemcode&filtervalues=${encoded}`,
+    `&filterfieldids=Itemcode&filtervalues=${encoded}&operatortypes=1`,
+
+    // daarna Code (essentieel voor jouw AFAS setup)
+    `&filterfieldids=Code&filtervalues=${encoded}`,
+    `&filterfieldids=Code&filtervalues=${encoded}&operatortypes=1`,
+  ];
+
+  for (const extraQuery of tries) {
+    try {
+      const data = await fetchAfas(connectorId, {
+        skip: 0,
+        take: 1,
+        extraQuery,
+      });
+
+      const row = data?.rows?.[0];
+      if (row) return row;
+    } catch (e) {
+      // negeren, volgende poging
+    }
   }
+
+  return null;
+}
 
   try {
     const data = await fetchAfas(connectorId, {
@@ -426,7 +441,7 @@ app.post("/sync/products", async (req, res) => {
 
   try {
     const { pages, totalRows } = await forEachAfasRow(connectorId, { take }, async (r) => {
-      const itemcode = r.Itemcode ?? null;
+      const itemcode = r.Itemcode ?? r.itemcode ?? r.Code ?? r.code ?? null;
       if (!itemcode) return;
 
       const ecomBool = parseBool(r["E-commerce_beschikbaar"]);
