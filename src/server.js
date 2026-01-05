@@ -897,6 +897,32 @@ app.get("/debug/pictures/db-counts", async (req, res) => {
   }
 });
 
+// DEBUG: welke ecommerce producten missen nog een MAIN record?
+app.get("/debug/pictures/missing-main", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    const r = await pool.query(`
+      SELECT p.itemcode
+      FROM products p
+      LEFT JOIN product_pictures pp
+        ON pp.itemcode = p.itemcode AND pp.kind = 'MAIN'
+      WHERE p.ecommerce_available = true
+        AND pp.itemcode IS NULL
+      ORDER BY p.itemcode
+    `);
+
+    res.json({
+      ok: true,
+      missing_count: r.rows.length,
+      itemcodes: r.rows.map(x => x.itemcode),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+
 /* =========================================================
    Error handler
    ========================================================= */
