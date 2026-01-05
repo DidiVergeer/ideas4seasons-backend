@@ -922,6 +922,31 @@ app.get("/debug/pictures/missing-main", async (req, res) => {
   }
 });
 
+// DEBUG: toon MAIN velden uit products.raw voor 1 item
+app.get("/debug/products/raw-main", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const { itemcode } = req.query;
+  if (!itemcode) {
+    return res.status(400).json({ ok: false, error: "itemcode required" });
+  }
+
+  const r = await pool.query(
+    `
+    SELECT
+      itemcode,
+      raw->>'Bestandsnaam_MAIN'      AS bestandsnaam_main,
+      raw->>'Origineel_bestand_MAIN' AS origineel_bestand_main,
+      raw->>'Bestandslocatie_MAIN'   AS bestandslocatie_main
+    FROM products
+    WHERE itemcode = $1
+    `,
+    [itemcode]
+  );
+
+  res.json({ ok: true, row: r.rows[0] || null });
+});
+
 
 /* =========================================================
    Error handler
