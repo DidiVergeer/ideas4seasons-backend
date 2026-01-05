@@ -1324,6 +1324,56 @@ app.get("/debug/pictures/missing-main", async (req, res) => {
   }
 });
 
+// DEBUG: test AFAS picture lookup per itemcode (geen base64)
+app.get("/debug/afas/pictures/lookup", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const itemcode = req.query.itemcode;
+  if (!itemcode) {
+    return res.status(400).json({ ok: false, error: "itemcode required" });
+  }
+
+  const connectorId = "Items_Pictures_app";
+  const encoded = encodeURIComponent(String(itemcode));
+
+  const tries = [
+    { label: "Itemcode exact", q: `&filterfieldids=Itemcode&filtervalues=${encoded}` },
+    { label: "Itemcode operatortypes=1", q: `&filterfieldids=Itemcode&filtervalues=${encoded}&operatortypes=1` },
+    { label: "Code exact", q: `&filterfieldids=Code&filtervalues=${encoded}` },
+    { label: "Code operatortypes=1", q: `&filterfieldids=Code&filtervalues=${encoded}&operatortypes=1` },
+  ];
+
+  const results = [];
+
+  for (const t of tries) {
+    try {
+      const data = await fetchAfas(connectorId, { skip: 0, take: 1, extraQuery: t.q });
+      const row = data?.rows?.[0] ?? null;
+
+      results.push({
+        try: t.label,
+        found: !!row,
+        hasMainFields: row
+          ? Boolean(row.Bestandsnaam_MAIN || row.Origineel_bestand_MAIN || row.Bestandslocatie_MAIN)
+          : false,
+        keys: row ? Object.keys(row) : [],
+      });
+    } catch (e) {
+      results.push({
+        try: t.label,
+        error: e.message,
+      });
+    }
+  }
+
+  res.json({
+    ok: true,
+    itemcode,
+    results,
+  });
+});
+
+
 /* =======================
    ERROR HANDLER
    ======================= */
