@@ -892,6 +892,80 @@ app.get("/debug/pictures/db-counts", async (req, res) => {
   }
 });
 
+// =======================
+// DEBUG: missing MAIN manifest (no base64)
+// GET /debug/pictures/missing-main?key=...
+// =======================
+app.get("/debug/pictures/missing-main", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    const r = await pool.query(`
+      SELECT p.itemcode
+      FROM products p
+      LEFT JOIN product_pictures pp
+        ON pp.itemcode = p.itemcode AND pp.kind = 'MAIN'
+      WHERE p.ecommerce_available = true
+        AND pp.itemcode IS NULL
+      ORDER BY p.itemcode
+    `);
+
+    res.json({ ok: true, missing_count: r.rows.length, itemcodes: r.rows.map(x => x.itemcode) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+
+// =======================
+// DEBUG: AFAS pictures lookup (no base64)
+// GET /debug/afas/pictures/lookup?key=...&itemcode=...
+// =======================
+app.get("/debug/afas/pictures/lookup", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const itemcode = String(req.query.itemcode || "").trim();
+  if (!itemcode) return res.status(400).json({ ok: false, error: "itemcode required" });
+
+  const encoded = encodeURIComponent(itemcode);
+
+  const tries = [
+    { label: "Itemcode exact", q: `&filterfieldids=Itemcode&filtervalues=${encoded}` },
+    { label: "Itemcode operatortypes=1", q: `&filterfieldids=Itemcode&filtervalues=${encoded}&operatortypes=1` },
+    { label: "Code exact", q: `&filterfieldids=Code&filtervalues=${encoded}` },
+    { label: "Code operatortypes=1", q: `&filterfieldids=Code&filtervalues=${encoded}&operatortypes=1` },
+  ];
+
+  const results = [];
+
+  for (const t of tries) {
+    try {
+      const data = await fetchAfasWithRetry("Items_Pictures_app", { skip: 0, take: 1, extraQuery: t.q });
+      const row = data?.rows?.[0] ?? null;
+
+      results.push({
+        try: t.label,
+        found: !!row,
+        hasMainFields: row ? Boolean(row.Bestandsnaam_MAIN || row.Origineel_bestand_MAIN || row.Bestandslocatie_MAIN) : false,
+        mainMeta: row
+          ? {
+              Bestandsnaam_MAIN: row.Bestandsnaam_MAIN ?? null,
+              Origineel_bestand_MAIN: row.Origineel_bestand_MAIN ?? null,
+              Bestandslocatie_MAIN: row.Bestandslocatie_MAIN ?? null,
+              Itemcode: row.Itemcode ?? null,
+              Code: row.Code ?? null,
+            }
+          : null,
+      });
+    } catch (e) {
+      results.push({ try: t.label, found: false, error: e?.message || String(e) });
+    }
+  }
+
+  res.json({ ok: true, itemcode, results });
+});
+
+
 /* =========================================================
    Error handler
    ========================================================= */
