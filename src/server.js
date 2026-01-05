@@ -1125,52 +1125,44 @@ app.get("/debug/images/counts", async (req, res) => {
 
 app.get("/debug/afas/pictures/counts", async (req, res) => {
   try {
-    const take = Number(req.query.take || 200);
+    const take = Math.min(1000, Math.max(1, Number(req.query.take || 200))); // max 1000
     const connectorId = "Items_Pictures_app";
 
-    let totalRows = 0;
+    const data = await fetchAfas(connectorId, { skip: 0, take });
+    const rows = data?.rows || [];
+
+    let totalRows = rows.length;
     let rowsWithItemcode = 0;
     let rowsWithCode = 0;
 
-    let mainMeta = 0;   // filename/original/location gevuld
-    let sfeer1Meta = 0;
-    let sfeer2Meta = 0;
-    let sfeer3Meta = 0;
-    let sfeer4Meta = 0;
-    let sfeer5Meta = 0;
+    const metaCounts = { MAIN: 0, SFEER_1: 0, SFEER_2: 0, SFEER_3: 0, SFEER_4: 0, SFEER_5: 0 };
 
-    await forEachAfasRow(connectorId, { take }, async (r) => {
-      totalRows += 1;
+    const hasMeta = (fn, of, loc) => Boolean(fn || of || loc);
 
+    for (const r of rows) {
       if (r.Itemcode || r.itemcode) rowsWithItemcode += 1;
       if (r.Code || r.code) rowsWithCode += 1;
 
-      const hasMeta = (fn, of, loc) => Boolean(fn || of || loc);
-
-      if (hasMeta(r.Bestandsnaam_MAIN, r.Origineel_bestand_MAIN, r.Bestandslocatie_MAIN)) mainMeta += 1;
-      if (hasMeta(r.Bestandsnaam_SFEER_1, r.Origineel_bestand_SFEER_1, r.Bestandslocatie_SFEER_1)) sfeer1Meta += 1;
-      if (hasMeta(r.Bestandsnaam_SFEER_2, r.Origineel_bestand_SFEER_2, r.Bestandslocatie_SFEER_2)) sfeer2Meta += 1;
-      if (hasMeta(r.Bestandsnaam_SFEER_3, r.Origineel_bestand_SFEER_3, r.Bestandslocatie_SFEER_3)) sfeer3Meta += 1;
-      if (hasMeta(r.Bestandsnaam_SFEER_4, r.Origineel_bestand_SFEER_4, r.Bestandslocatie_SFEER_4)) sfeer4Meta += 1;
-      if (hasMeta(r.Bestandsnaam_SFEER_5, r.Origineel_bestand_SFEER_5, r.Bestandslocatie_SFEER_5)) sfeer5Meta += 1;
-    });
+      if (hasMeta(r.Bestandsnaam_MAIN, r.Origineel_bestand_MAIN, r.Bestandslocatie_MAIN)) metaCounts.MAIN += 1;
+      if (hasMeta(r.Bestandsnaam_SFEER_1, r.Origineel_bestand_SFEER_1, r.Bestandslocatie_SFEER_1)) metaCounts.SFEER_1 += 1;
+      if (hasMeta(r.Bestandsnaam_SFEER_2, r.Origineel_bestand_SFEER_2, r.Bestandslocatie_SFEER_2)) metaCounts.SFEER_2 += 1;
+      if (hasMeta(r.Bestandsnaam_SFEER_3, r.Origineel_bestand_SFEER_3, r.Bestandslocatie_SFEER_3)) metaCounts.SFEER_3 += 1;
+      if (hasMeta(r.Bestandsnaam_SFEER_4, r.Origineel_bestand_SFEER_4, r.Bestandslocatie_SFEER_4)) metaCounts.SFEER_4 += 1;
+      if (hasMeta(r.Bestandsnaam_SFEER_5, r.Origineel_bestand_SFEER_5, r.Bestandslocatie_SFEER_5)) metaCounts.SFEER_5 += 1;
+    }
 
     res.json({
       ok: true,
       connectorId,
+      sampled: true,
+      take,
       totalRows,
       rowsWithItemcode,
       rowsWithCode,
-      metaCounts: {
-        MAIN: mainMeta,
-        SFEER_1: sfeer1Meta,
-        SFEER_2: sfeer2Meta,
-        SFEER_3: sfeer3Meta,
-        SFEER_4: sfeer4Meta,
-        SFEER_5: sfeer5Meta,
-      },
+      metaCounts,
     });
   } catch (err) {
+    console.error("debug/afas/pictures/counts:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
