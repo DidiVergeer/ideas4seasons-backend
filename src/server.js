@@ -1,3 +1,4 @@
+// src/server.js
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -16,16 +17,33 @@ const PORT = process.env.PORT || 3000;
 /* =======================
    CORS
    ======================= */
+
+// ✅ voeg Expo Web origins toe (8081)
+const ALLOWED_ORIGINS = [
+  "http://localhost:3000",
+  "http://localhost:8081",
+  "http://127.0.0.1:8081",
+  "https://ideas4seasons-frontend.onrender.com",
+];
+
+// ✅ Gebruik function origin check (mobiel/native requests hebben vaak geen Origin header)
 app.use(
   cors({
-    origin: [
-      "http://localhost:3000",
-      "https://ideas4seasons-frontend.onrender.com",
-    ],
+    origin: (origin, cb) => {
+      // Geen origin? (bijv. native apps / curl) → toestaan
+      if (!origin) return cb(null, true);
+
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+
+      return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
+// ✅ Preflight netjes afhandelen
+app.options("*", cors());
 
 app.use(express.json());
 
@@ -183,7 +201,6 @@ app.post("/sync/products", async (req, res) => {
         const itemcode = r.Itemcode ?? null;
         if (!itemcode) continue;
 
-        // ✅ FIX: "E-commerce_beschikbaar": "Ja" => boolean
         const ecomRaw = r["E-commerce_beschikbaar"] ?? null;
         const ecomBool = ecomRaw === "Ja";
 
@@ -228,8 +245,8 @@ app.post("/sync/products", async (req, res) => {
             r.INNERCARTON ?? null,
             r["EAN_product__Opgeschoonde_barcode_"] ?? null,
             r.Beschikbare_voorraad ?? null,
-            ecomBool, // ✅ boolean
-            r,        // raw JSONB
+            ecomBool,
+            r,
           ]
         );
 
@@ -255,9 +272,16 @@ app.post("/sync/products", async (req, res) => {
    ======================= */
 
 // GET /products?limit=50&offset=0
+// ✅ Ook: /products?take=50&skip=0 (alias)
+// ✅ Optioneel: &array=1 -> return alleen de array (handig voor Expo client)
 app.get("/products", async (req, res) => {
-  const limit = Number(req.query.limit) || 50;
-  const offset = Number(req.query.offset) || 0;
+  const take = req.query.take != null ? Number(req.query.take) : null;
+  const skip = req.query.skip != null ? Number(req.query.skip) : null;
+
+  const limit = Number(req.query.limit) || take || 50;
+  const offset = Number(req.query.offset) || skip || 0;
+
+  const asArray = String(req.query.array || "") === "1";
 
   try {
     const { rows } = await pool.query(
@@ -270,6 +294,8 @@ app.get("/products", async (req, res) => {
       `,
       [limit, offset]
     );
+
+    if (asArray) return res.json(rows);
 
     res.json({ ok: true, limit, offset, count: rows.length, data: rows });
   } catch (err) {
@@ -384,10 +410,9 @@ app.post("/auth/login", async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      "SELECT * FROM agents WHERE agent_id = $1",
-      [agentId]
-    );
+    const result = await pool.query("SELECT * FROM agents WHERE agent_id = $1", [
+      agentId,
+    ]);
 
     if (result.rows.length === 0) {
       return res.status(401).json({ error: "Invalid credentials" });
@@ -399,11 +424,9 @@ app.post("/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const token = jwt.sign(
-      { agentId: agent.agent_id },
-      process.env.JWT_SECRET,
-      { expiresIn: "8h" }
-    );
+    const token = jwt.sign({ agentId: agent.agent_id }, process.env.JWT_SECRET, {
+      expiresIn: "8h",
+    });
 
     res.json({ token, agentId: agent.agent_id });
   } catch (err) {
