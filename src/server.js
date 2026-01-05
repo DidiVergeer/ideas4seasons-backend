@@ -996,6 +996,46 @@ app.use((err, req, res, next) => {
 /* =========================================================
    Start + graceful shutdown
    ========================================================= */
+
+app.get("/debug/afas/items-core-lookup", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const itemcode = String(req.query.itemcode || "").trim();
+  if (!itemcode) return res.status(400).json({ ok: false, error: "itemcode required" });
+
+  const connectorId = req.query.connectorId || "Items_Core";
+  const encoded = encodeURIComponent(itemcode);
+
+  const tries = [
+    `&filterfieldids=Itemcode&filtervalues=${encoded}`,
+    `&filterfieldids=Itemcode&filtervalues=${encoded}&operatortypes=1`,
+    `&filterfieldids=Code&filtervalues=${encoded}`,
+    `&filterfieldids=Code&filtervalues=${encoded}&operatortypes=1`,
+  ];
+
+  for (const extraQuery of tries) {
+    try {
+      const data = await fetchAfasWithRetry(connectorId, { skip: 0, take: 1, extraQuery });
+      const row = data?.rows?.[0];
+      if (row) {
+        return res.json({
+          ok: true,
+          connectorId,
+          try: extraQuery,
+          main: {
+            Bestandsnaam_MAIN: row.Bestandsnaam_MAIN ?? null,
+            Origineel_bestand_MAIN: row.Origineel_bestand_MAIN ?? null,
+            Bestandslocatie_MAIN: row.Bestandslocatie_MAIN ?? null,
+          },
+        });
+      }
+    } catch {}
+  }
+
+  res.json({ ok: true, connectorId, found: false });
+});
+
+
 const server = app.listen(PORT, () => {
   console.log(`API running on port ${PORT}`);
 });
