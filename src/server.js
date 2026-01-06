@@ -1373,6 +1373,28 @@ app.get("/debug/pictures/by-item", async (req, res) => {
   }
 });
 
+// DEBUG: sample SFEER cdn_url's (no base64)
+// GET /debug/pictures/sfeer-with-cdn-sample?key=...
+app.get("/debug/pictures/sfeer-with-cdn-sample", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    const r = await pool.query(`
+      SELECT itemcode, kind, cdn_url
+      FROM product_pictures
+      WHERE kind LIKE 'SFEER_%'
+        AND cdn_url IS NOT NULL
+      ORDER BY updated_at DESC
+      LIMIT 10
+    `);
+
+    res.json({ ok: true, rows: r.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+
 /* =========================================================
    Error handler
    ========================================================= */
