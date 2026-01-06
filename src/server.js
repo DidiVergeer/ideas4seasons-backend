@@ -1394,6 +1394,170 @@ app.get("/debug/pictures/sfeer-with-cdn-sample", async (req, res) => {
   }
 });
 
+/* =========================================================
+   STEP 1 — SFEER manifest (product-driven, from Items_Pictures_app per item)
+   - MAIN blijft ongewijzigd
+   - SFEER records worden per slot (1..5) aangemaakt
+   - picture_id is kind-aware om collisions te vermijden
+   ========================================================= */
+
+function readSfeerMeta(afasRow, n) {
+  // Try common meta field naming patterns (differs per AFAS connector)
+  const filename =
+    afasRow?.[`Bestandsnaam_${n}`] ??
+    afasRow?.[`Bestandsnaam_SFEER_${n}`] ??
+    afasRow?.[`Bestandsnaam_Afbeelding_${n}`] ??
+    null;
+
+  const original_file =
+    afasRow?.[`Origineel_bestand_${n}`] ??
+    afasRow?.[`Origineel_bestand_SFEER_${n}`] ??
+    afasRow?.[`Originele_Afbeelding_${n}`] ??
+    afasRow?.[`OrigineleAfbeelding_${n}`] ??
+    null;
+
+  const location =
+    afasRow?.[`Bestandslocatie_${n}`] ??
+    afasRow?.[`Locatie_${n}`] ??
+    afasRow?.[`Locatie_SFEER_${n}`] ??
+    null;
+
+  return { filename, original_file, location };
+}
+
+async function upsertSfeerPictureManifest(itemcode, afasRow, n) {
+  const kind = `SFEER_${n}`;
+  const b64Field = `Afbeelding_${n}`;
+
+  // We bepalen "bestaat sfeer?" primair op base64 aanwezigheid (betrouwbaar)
+  const b64 = normalizeBase64(afasRow?.[b64Field]);
+  if (!b64) return { ok: false, reason: "no_base64" };
+
+  const { filename, original_file, location } = readSfeerMeta(afasRow, n);
+  const mime = guessMimeFromFilename(filename) || guessMimeFromBase64(b64) || "image/jpeg";
+
+  // Kind-aware stable id => voorkomt dat SFEER_1 en SFEER_2 elkaar overschrijven
+  const stableId = String(original_file || location || filename || `${itemcode}:${kind}`);
+  const picture_id = sha1(`${itemcode}:${kind}:${stableId}`);
+
+  await pool.query(
+    `
+    INSERT INTO product_pictures (
+      itemcode, picture_id, kind,
+      filename, original_file, location, mime,
+      cdn_url, needs_fetch, sort_order, raw, updated_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,true,$8,$9,NOW())
+    ON CONFLICT (itemcode, picture_id) DO UPDATE SET
+      kind = EXCLUDED.kind,
+      filename = EXCLUDED.filename,
+      original_file = EXCLUDED.original_file,
+      location = EXCLUDED.location,
+      mime = EXCLUDED.mime,
+      sort_order = EXCLUDED.sort_order,
+      raw = EXCLUDED.raw,
+      updated_at = NOW(),
+      needs_fetch =
+        (product_pictures.cdn_url IS NULL)
+        OR (product_pictures.filename IS DISTINCT FROM EXCLUDED.filename)
+        OR (product_pictures.original_file IS DISTINCT FROM EXCLUDED.original_file)
+        OR (product_pictures.location IS DISTINCT FROM EXCLUDED.location)
+        OR (product_pictures.mime IS DISTINCT FROM EXCLUDED.mime)
+    `,
+    [
+      String(itemcode),
+      String(picture_id),
+      kind,
+      filename ? String(filename) : null,
+      original_file ? String(original_file) : null,
+      location ? String(location) : null,
+      mime,
+      Number(n), // sort_order 1..5
+      afasRow, // raw: hele afasRow (zonder base64 opslaan in DB, want je slaat r op maar r bevat base64; als je dat NIET wilt, vervang door {} )
+    ]
+  );
+
+  return { ok: true, kind, picture_id };
+}
+
+// Shared handler so GET and POST behave identical
+async function handleSfeerManifest(req, res) {
+  if (!requireSetupKey(req, res)) return;
+
+  const limit = Math.min(2000, Math.max(1, Number(req.query.limit || 200)));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+  const onlyItemcode = String(req.query.itemcode || "").trim();
+
+  try {
+    // Optional cleanup: remove legacy rows with kind NULL (safe)
+    await pool.query(`DELETE FROM product_pictures WHERE kind IS NULL`);
+
+    const pr = await pool.query(
+      `
+      SELECT itemcode
+      FROM products
+      WHERE ecommerce_available = true
+        AND ($3 = '' OR itemcode = $3)
+      ORDER BY itemcode
+      LIMIT $1 OFFSET $2
+      `,
+      [limit, offset, onlyItemcode]
+    );
+
+    let processed = 0;
+    let foundAfas = 0;
+    let created = 0;
+    let noAfasRow = 0;
+    let noSlots = 0;
+
+    for (const row of pr.rows) {
+      const itemcode = row.itemcode;
+      if (!itemcode) continue;
+
+      if (EXCLUDE_A_CODES && String(itemcode).startsWith("A")) continue;
+
+      processed += 1;
+
+      const afasRow = await fetchAfasPicturesRowByItemcode(itemcode);
+      if (!afasRow) {
+        noAfasRow += 1;
+        continue;
+      }
+      foundAfas += 1;
+
+      let any = false;
+      for (let n = 1; n <= 5; n++) {
+        const r = await upsertSfeerPictureManifest(itemcode, afasRow, n);
+        if (r.ok) {
+          any = true;
+          created += 1;
+        }
+      }
+      if (!any) noSlots += 1;
+    }
+
+    res.json({
+      ok: true,
+      limit,
+      offset,
+      itemcode: onlyItemcode || null,
+      processed,
+      foundAfas,
+      created,
+      noAfasRow,
+      noSlots,
+    });
+  } catch (err) {
+    console.error("sync/pictures-sfeer-manifest:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+}
+
+// POST for scripts
+app.post("/sync/pictures-sfeer-manifest", handleSfeerManifest);
+// GET for browser convenience
+app.get("/sync/pictures-sfeer-manifest", handleSfeerManifest);
+
 
 /* =========================================================
    Error handler
