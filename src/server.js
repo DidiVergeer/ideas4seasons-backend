@@ -1203,6 +1203,24 @@ app.get("/debug/pictures/sfeer-counts", async (req, res) => {
   }
 });
 
+// GET /debug/stock-schema?key=...
+app.get("/debug/stock-schema", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    const r = await pool.query(`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_name = 'product_stock'
+      ORDER BY ordinal_position
+    `);
+    res.json({ ok: true, columns: r.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+
 /* =========================================================
    Error handler
    ========================================================= */
