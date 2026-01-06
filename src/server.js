@@ -429,6 +429,38 @@ app.post("/db/setup-afas-extra", async (req, res) => {
       );
     `);
 
+    // 1) verwijder dubbele itemcodes (houd nieuwste)
+await pool.query(`
+  WITH ranked AS (
+    SELECT
+      ctid,
+      itemcode,
+      updated_at,
+      ROW_NUMBER() OVER (PARTITION BY itemcode ORDER BY updated_at DESC) AS rn
+    FROM product_stock
+  )
+  DELETE FROM product_stock ps
+  USING ranked r
+  WHERE ps.ctid = r.ctid
+    AND r.rn > 1;
+`);
+
+// 2) voeg UNIQUE constraint toe op itemcode (als die nog niet bestaat)
+await pool.query(`
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_constraint
+      WHERE conname = 'product_stock_itemcode_unique'
+    ) THEN
+      ALTER TABLE product_stock
+      ADD CONSTRAINT product_stock_itemcode_unique UNIQUE (itemcode);
+    END IF;
+  END $$;
+`);
+
+
     // in case table existed with missing columns (this prevents your "column does not exist" issue)
     await pool.query(`
       ALTER TABLE product_stock
