@@ -1344,6 +1344,83 @@ app.get("/debug/afas/sfeer-slots-total", async (req, res) => {
   }
 });
 
+// routes/debug/pictures.js of routes/sync/pictures.js
+import pLimit from "p-limit";
+import { pool } from "../db/pool.js"; // jouw pool import
+import { requireSetupKey } from "../middleware/requireSetupKey.js"; // jouw setup-key middleware
+import { fetchAfasSfeerBase64 } from "../afas/fetchAfasSfeerBase64.js"; // jij maakt deze
+import { uploadToCdn } from "../cdn/uploadToCdn.js"; // jij maakt deze
+
+router.post("/sync/pictures/sfeer", requireSetupKey, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit ?? "50", 10), 500);
+  const concurrency = Math.min(parseInt(req.query.concurrency ?? "3", 10), 5);
+
+  // 1) pak alleen records zonder cdn
+  const { rows } = await pool.query(
+    `
+    SELECT id, itemcode, afas_picture_id
+    FROM product_pictures
+    WHERE type = 'sfeer'
+      AND (cdn_url IS NULL OR cdn_url = '')
+    ORDER BY id
+    LIMIT $1
+    `,
+    [limit]
+  );
+
+  const limiter = pLimit(concurrency);
+
+  let uploaded = 0;
+  let failed = 0;
+
+  await Promise.all(
+    rows.map((r) =>
+      limiter(async () => {
+        try {
+          // 2) haal base64 uit AFAS (of waar je bron ook zit)
+          const { base64, mime } = await fetchAfasSfeerBase64(r.afas_picture_id);
+
+          // 3) upload naar CDN
+          const cdnUrl = await uploadToCdn({
+            itemcode: r.itemcode,
+            base64,
+            mime,
+          });
+
+          // 4) schrijf terug
+          await pool.query(
+            `
+            UPDATE product_pictures
+            SET cdn_url = $1, uploaded_at = NOW()
+            WHERE id = $2
+            `,
+            [cdnUrl, r.id]
+          );
+
+          uploaded++;
+        } catch (e) {
+          failed++;
+          // optioneel: log error in tabel
+          await pool.query(
+            `UPDATE product_pictures SET last_error = $1, last_error_at = NOW() WHERE id = $2`,
+            [String(e?.message ?? e), r.id]
+          );
+        }
+      })
+    )
+  );
+
+  res.json({
+    ok: true,
+    queued: rows.length,
+    uploaded,
+    failed,
+    limit,
+    concurrency,
+  });
+});
+
+
 
 /* =========================================================
    Error handler
