@@ -1344,6 +1344,35 @@ app.get("/debug/afas/sfeer-slots-total", async (req, res) => {
   }
 });
 
+// DEBUG: pictures for 1 item (safe, no base64)
+// GET /debug/pictures/by-item?key=...&itemcode=...
+app.get("/debug/pictures/by-item", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const itemcode = String(req.query.itemcode || "").trim();
+  if (!itemcode) return res.status(400).json({ ok: false, error: "itemcode required" });
+
+  try {
+    const r = await pool.query(
+      `
+      SELECT itemcode, kind, sort_order, picture_id, needs_fetch, cdn_url, updated_at
+      FROM product_pictures
+      WHERE itemcode = $1
+      ORDER BY
+        CASE WHEN kind='MAIN' THEN 0 ELSE 1 END,
+        COALESCE(sort_order, 999),
+        kind,
+        picture_id
+      `,
+      [itemcode]
+    );
+
+    res.json({ ok: true, itemcode, count: r.rows.length, rows: r.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 /* =========================================================
    Error handler
    ========================================================= */
