@@ -615,6 +615,144 @@ app.post("/sync/pictures-main-from-products", async (req, res) => {
 });
 
 /* =========================================================
+   STEP 1B — SFEER manifest (product-driven, truth = Items_Pictures_app per item)
+   IMPORTANT: MAIN logic untouched.
+   ========================================================= */
+
+/**
+ * We treat Afbeelding_1..5 as base64 fields.
+ * picture_id must be stable + avoid collisions with MAIN and between kinds.
+ * We hash the base64 (content hash) and then include itemcode+kind in the final id.
+ * This way:
+ * - same content in SFEER_1 and SFEER_2 won't collide
+ * - content change creates new picture_id -> new R2 key -> upload works (HEAD won't block)
+ */
+async function upsertSfeerPictureManifest(itemcode, kind, sort_order, afasRow) {
+  const b64Field = KIND_TO_AFAS_B64_FIELD[kind];
+  if (!b64Field) return { ok: false, reason: "unknown_kind" };
+
+  const b64 = normalizeBase64(afasRow?.[b64Field]);
+  if (!b64) {
+    return { ok: false, reason: "no_b64" };
+  }
+
+  const contentHash = sha1(b64);
+  const picture_id = sha1(`${itemcode}:${kind}:${contentHash}`);
+
+  // We don't have filename/location meta for sfeer in your connector (based on your spec),
+  // so we store minimal metadata and keep raw (without trimming) for debugging.
+  await pool.query(
+    `
+    INSERT INTO product_pictures (
+      itemcode, picture_id, kind,
+      filename, original_file, location, mime,
+      cdn_url, needs_fetch, sort_order, raw, updated_at
+    )
+    VALUES ($1,$2,$3,NULL,NULL,NULL,NULL,NULL,true,$4,$5,NOW())
+    ON CONFLICT (itemcode, picture_id) DO UPDATE SET
+      kind = EXCLUDED.kind,
+      sort_order = EXCLUDED.sort_order,
+      raw = EXCLUDED.raw,
+      updated_at = NOW(),
+      needs_fetch = (product_pictures.cdn_url IS NULL) OR (product_pictures.needs_fetch = true)
+    `,
+    [String(itemcode), String(picture_id), String(kind), Number(sort_order) || 0, afasRow]
+  );
+
+  return { ok: true, picture_id };
+}
+
+// POST /sync/pictures-sfeer-manifest?key=...&limit=200&offset=0
+app.post("/sync/pictures-sfeer-manifest", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const limit = Math.min(2000, Math.max(1, Number(req.query.limit || 200)));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+
+  try {
+    const pr = await pool.query(
+      `
+      SELECT itemcode
+      FROM products
+      WHERE ecommerce_available = true
+      ORDER BY itemcode
+      LIMIT $1 OFFSET $2
+      `,
+      [limit, offset]
+    );
+
+    let processed = 0;
+    let skippedA = 0;
+    let missingInAfas = 0;
+    let foundAfas = 0;
+
+    let sfeerUpserts = 0;
+    let sfeerSlotsWithB64 = 0; // how many slots had data
+    let sfeerSlotsNoB64 = 0; // slots checked but empty
+
+    for (const row of pr.rows) {
+      const itemcode = row.itemcode;
+      if (!itemcode) continue;
+
+      if (EXCLUDE_A_CODES && String(itemcode).startsWith("A")) {
+        skippedA += 1;
+        continue;
+      }
+
+      processed += 1;
+
+      const afasRow = await fetchAfasPicturesRowByItemcode(itemcode);
+      if (!afasRow) {
+        missingInAfas += 1;
+        continue;
+      }
+
+      foundAfas += 1;
+
+      // Check SFEER_1..SFEER_5 (base64 presence)
+      const slots = [
+        { kind: "SFEER_1", sort: 1 },
+        { kind: "SFEER_2", sort: 2 },
+        { kind: "SFEER_3", sort: 3 },
+        { kind: "SFEER_4", sort: 4 },
+        { kind: "SFEER_5", sort: 5 },
+      ];
+
+      for (const s of slots) {
+        const b64Field = KIND_TO_AFAS_B64_FIELD[s.kind];
+        const b64 = normalizeBase64(afasRow?.[b64Field]);
+
+        if (!b64) {
+          sfeerSlotsNoB64 += 1;
+          continue;
+        }
+
+        sfeerSlotsWithB64 += 1;
+
+        const r = await upsertSfeerPictureManifest(itemcode, s.kind, s.sort, afasRow);
+        if (r.ok) sfeerUpserts += 1;
+      }
+    }
+
+    res.json({
+      ok: true,
+      limit,
+      offset,
+      processed,
+      skippedA,
+      foundAfas,
+      missingInAfas,
+      sfeerSlotsWithB64,
+      sfeerSlotsNoB64,
+      sfeerUpserts,
+    });
+  } catch (err) {
+    console.error("sync/pictures-sfeer-manifest:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+/* =========================================================
    STEP 2 — Upload job (base64 from Items_Pictures_app -> R2)
    ========================================================= */
 const KIND_TO_AFAS_B64_FIELD = {
@@ -700,6 +838,8 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
         const buf = Buffer.from(b64, "base64");
 
         // deterministic per picture_id
+        // MAIN -> products/{itemcode}/main_{picture_id}.jpg
+        // SFEER_1 -> products/{itemcode}/sfeer_1_{picture_id}.jpg  (matches your desired scheme)
         const key = `products/${itemcode}/${kind.toLowerCase()}_${pic.picture_id}.${ext}`;
 
         const exists = await headR2(key);
@@ -892,6 +1032,65 @@ app.get("/debug/pictures/db-counts", async (req, res) => {
   }
 });
 
+// NEW: SFEER counts (how many sfeer records / with CDN / products that have >=1 sfeer)
+app.get("/debug/pictures/sfeer-counts", async (req, res) => {
+  try {
+    const a = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE kind LIKE 'SFEER_%')::int AS sfeer_records_total,
+        COUNT(*) FILTER (WHERE kind LIKE 'SFEER_%' AND cdn_url IS NOT NULL)::int AS sfeer_with_cdn,
+        COUNT(*) FILTER (WHERE kind LIKE 'SFEER_%' AND cdn_url IS NULL)::int AS sfeer_missing_cdn
+      FROM product_pictures
+    `);
+
+    const b = await pool.query(`
+      SELECT COUNT(DISTINCT p.itemcode)::int AS ecommerce_products_with_sfeer_cdn
+      FROM products p
+      JOIN product_pictures pp
+        ON pp.itemcode = p.itemcode
+       AND pp.kind LIKE 'SFEER_%'
+       AND pp.cdn_url IS NOT NULL
+      WHERE p.ecommerce_available = true
+    `);
+
+    res.json({ ok: true, ...a.rows[0], ...b.rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+// NEW: which ecommerce products have MAIN but no SFEER cdn (useful list)
+app.get("/debug/pictures/missing-sfeer", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    const r = await pool.query(`
+      SELECT p.itemcode
+      FROM products p
+      WHERE p.ecommerce_available = true
+        AND EXISTS (
+          SELECT 1
+          FROM product_pictures pp
+          WHERE pp.itemcode = p.itemcode
+            AND pp.kind='MAIN'
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM product_pictures pp
+          WHERE pp.itemcode = p.itemcode
+            AND pp.kind LIKE 'SFEER_%'
+            AND pp.cdn_url IS NOT NULL
+        )
+      ORDER BY p.itemcode
+      LIMIT 200
+    `);
+
+    res.json({ ok: true, missing_count: r.rows.length, itemcodes: r.rows.map((x) => x.itemcode) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 // =======================
 // DEBUG: missing MAIN manifest (no base64)
 // GET /debug/pictures/missing-main?key=...
@@ -910,12 +1109,11 @@ app.get("/debug/pictures/missing-main", async (req, res) => {
       ORDER BY p.itemcode
     `);
 
-    res.json({ ok: true, missing_count: r.rows.length, itemcodes: r.rows.map(x => x.itemcode) });
+    res.json({ ok: true, missing_count: r.rows.length, itemcodes: r.rows.map((x) => x.itemcode) });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
-
 
 // =======================
 // DEBUG: AFAS pictures lookup (no base64)
@@ -947,6 +1145,16 @@ app.get("/debug/afas/pictures/lookup", async (req, res) => {
         try: t.label,
         found: !!row,
         hasMainFields: row ? Boolean(row.Bestandsnaam_MAIN || row.Origineel_bestand_MAIN || row.Bestandslocatie_MAIN) : false,
+        // added: quick sfeer presence checks (no base64 included here; just flags)
+        hasSfeer: row
+          ? {
+              SFEER_1: Boolean(normalizeBase64(row.Afbeelding_1)),
+              SFEER_2: Boolean(normalizeBase64(row.Afbeelding_2)),
+              SFEER_3: Boolean(normalizeBase64(row.Afbeelding_3)),
+              SFEER_4: Boolean(normalizeBase64(row.Afbeelding_4)),
+              SFEER_5: Boolean(normalizeBase64(row.Afbeelding_5)),
+            }
+          : null,
         mainMeta: row
           ? {
               Bestandsnaam_MAIN: row.Bestandsnaam_MAIN ?? null,
@@ -984,7 +1192,6 @@ app.get("/debug/pictures/missing-cdn-main", async (req, res) => {
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
-
 
 /* =========================================================
    Error handler
