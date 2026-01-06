@@ -404,7 +404,25 @@ app.post("/db/setup-afas-extra", async (req, res) => {
       ON product_pictures (itemcode, kind, sort_order, picture_id);
     `);
 
-    res.json({ ok: true, message: "product_pictures table ready" });
+    await pool.query(`
+  CREATE TABLE IF NOT EXISTS product_stock (
+    itemcode TEXT PRIMARY KEY,
+    available_stock NUMERIC NULL,
+    economic_stock NUMERIC NULL,
+    on_order NUMERIC NULL,
+    arrival_date DATE NULL,
+    updated_at TIMESTAMP DEFAULT NOW(),
+    raw JSONB NULL
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS idx_product_stock_updated_at
+  ON product_stock(updated_at);
+`);
+
+
+    res.json({ ok: true, message: "product_pictures + product_stock ready" });
   } catch (err) {
     console.error("db/setup-afas-extra:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
