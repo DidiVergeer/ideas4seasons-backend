@@ -1193,6 +1193,42 @@ app.get("/debug/pictures/missing-cdn-main", async (req, res) => {
   }
 });
 
+app.get("/debug/pictures/sfeer-by-kind", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT kind,
+             COUNT(*)::int AS records,
+             COUNT(*) FILTER (WHERE cdn_url IS NOT NULL)::int AS with_cdn
+      FROM product_pictures
+      WHERE kind LIKE 'SFEER_%'
+      GROUP BY kind
+      ORDER BY kind
+    `);
+    res.json({ ok: true, rows: r.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+app.get("/debug/pictures/sfeer-collisions", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT itemcode,
+             COUNT(*)::int AS sfeer_records,
+             COUNT(DISTINCT kind)::int AS distinct_kinds
+      FROM product_pictures
+      WHERE kind LIKE 'SFEER_%'
+      GROUP BY itemcode
+      HAVING COUNT(*) > 0 AND COUNT(*) < COUNT(DISTINCT kind)
+      LIMIT 50
+    `);
+    res.json({ ok: true, rows: r.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+
 /* =========================================================
    Error handler
    ========================================================= */
