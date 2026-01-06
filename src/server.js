@@ -1228,6 +1228,72 @@ app.get("/debug/pictures/sfeer-collisions", async (req, res) => {
   }
 });
 
+app.get("/debug/afas/sfeer-slots-per-item", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+
+  try {
+    const pr = await pool.query(
+      `
+      SELECT itemcode
+      FROM products
+      WHERE ecommerce_available = true
+      ORDER BY itemcode
+      LIMIT $1 OFFSET $2
+      `,
+      [limit, offset]
+    );
+
+    const out = [];
+
+    for (const row of pr.rows) {
+      const itemcode = row.itemcode;
+
+      if (EXCLUDE_A_CODES && String(itemcode).startsWith("A")) continue;
+
+      const afasRow = await fetchAfasPicturesRowByItemcode(itemcode);
+      if (!afasRow) {
+        out.push({ itemcode, afas_found: false, afas_slots_filled: 0 });
+        continue;
+      }
+
+      const slots = [
+        Boolean(normalizeBase64(afasRow.Afbeelding_1)),
+        Boolean(normalizeBase64(afasRow.Afbeelding_2)),
+        Boolean(normalizeBase64(afasRow.Afbeelding_3)),
+        Boolean(normalizeBase64(afasRow.Afbeelding_4)),
+        Boolean(normalizeBase64(afasRow.Afbeelding_5)),
+      ];
+
+      const afas_slots_filled = slots.filter(Boolean).length;
+
+      out.push({
+        itemcode,
+        afas_found: true,
+        afas_slots_filled,
+        slots, // [true/false,...] for quick debug
+      });
+    }
+
+    const total_slots = out.reduce((a, x) => a + (x.afas_slots_filled || 0), 0);
+    const items_with_any = out.filter((x) => (x.afas_slots_filled || 0) > 0).length;
+
+    res.json({
+      ok: true,
+      limit,
+      offset,
+      returned: out.length,
+      items_with_any,
+      total_slots,
+      data: out,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 
 /* =========================================================
    Error handler
