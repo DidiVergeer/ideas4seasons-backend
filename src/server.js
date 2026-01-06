@@ -1294,6 +1294,56 @@ app.get("/debug/afas/sfeer-slots-per-item", async (req, res) => {
   }
 });
 
+// DEBUG: total filled SFEER slots in AFAS for ecommerce items
+// GET /debug/afas/sfeer-slots-total?limit=500&offset=0  (requires x-setup-key)
+app.get("/debug/afas/sfeer-slots-total", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const limit = Math.min(2000, Math.max(1, Number(req.query.limit || 500)));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+
+  try {
+    const pr = await pool.query(
+      `
+      SELECT itemcode
+      FROM products
+      WHERE ecommerce_available = true
+      ORDER BY itemcode
+      LIMIT $1 OFFSET $2
+      `,
+      [limit, offset]
+    );
+
+    let processed = 0;
+    let foundAfas = 0;
+    let totalSlots = 0;
+
+    for (const row of pr.rows) {
+      const itemcode = row.itemcode;
+      if (EXCLUDE_A_CODES && String(itemcode).startsWith("A")) continue;
+
+      processed += 1;
+
+      const afasRow = await fetchAfasPicturesRowByItemcode(itemcode);
+      if (!afasRow) continue;
+
+      foundAfas += 1;
+
+      totalSlots +=
+        (normalizeBase64(afasRow.Afbeelding_1) ? 1 : 0) +
+        (normalizeBase64(afasRow.Afbeelding_2) ? 1 : 0) +
+        (normalizeBase64(afasRow.Afbeelding_3) ? 1 : 0) +
+        (normalizeBase64(afasRow.Afbeelding_4) ? 1 : 0) +
+        (normalizeBase64(afasRow.Afbeelding_5) ? 1 : 0);
+    }
+
+    res.json({ ok: true, limit, offset, processed, foundAfas, totalSlots });
+  } catch (err) {
+    console.error("debug/afas/sfeer-slots-total:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 
 /* =========================================================
    Error handler
