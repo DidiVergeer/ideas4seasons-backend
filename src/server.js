@@ -185,7 +185,7 @@ function parseBool(v) {
 }
 
 /* =========================================================
-   IMPORTANT: mapping MUST be defined before STEP 1B uses it
+   Field mapping (must exist before SFEER code uses it)
    ========================================================= */
 const KIND_TO_AFAS_B64_FIELD = {
   MAIN: "Afbeelding",
@@ -259,18 +259,6 @@ async function fetchAfasWithRetry(connectorId, opts = {}, retry = {}) {
   throw lastErr || new Error("AFAS fetch failed");
 }
 
-async function forEachAfasRow(connectorId, { take = 200, extraQuery = "" } = {}, onRow) {
-  let skip = 0;
-  while (true) {
-    const data = await fetchAfasWithRetry(connectorId, { skip, take, extraQuery });
-    const rows = data?.rows || [];
-    if (rows.length === 0) break;
-    for (const r of rows) await onRow(r);
-    skip += rows.length;
-    if (rows.length < take) break;
-  }
-}
-
 /**
  * Items_Pictures_app per-item lookup. Filtering can be flaky.
  * We try Itemcode + Code, with/without operatortypes=1.
@@ -314,6 +302,7 @@ async function uploadToR2({ key, body, contentType }) {
   if (!r2) throw new Error("R2 not configured");
   if (!R2_PUBLIC_BASE_URL) throw new Error("Missing R2_PUBLIC_BASE_URL");
 
+  // PutObject overwrites existing object (important for changed photos)
   await r2.send(
     new PutObjectCommand({
       Bucket: R2_BUCKET,
@@ -423,6 +412,55 @@ app.post("/db/setup-afas-extra", async (req, res) => {
 });
 
 /* =========================================================
+   One-time cleanup: remove duplicates per (itemcode, kind) for SFEER
+   Keeps the row with cdn_url if possible, otherwise the newest.
+   ========================================================= */
+// POST /db/cleanup-sfeer-duplicates?key=...
+app.post("/db/cleanup-sfeer-duplicates", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    const before = await pool.query(`
+      SELECT COUNT(*)::int AS total
+      FROM product_pictures
+      WHERE kind LIKE 'SFEER_%'
+    `);
+
+    await pool.query(`
+      WITH ranked AS (
+        SELECT
+          ctid,
+          itemcode,
+          kind,
+          cdn_url,
+          updated_at,
+          ROW_NUMBER() OVER (
+            PARTITION BY itemcode, kind
+            ORDER BY (cdn_url IS NOT NULL) DESC, updated_at DESC
+          ) AS rn
+        FROM product_pictures
+        WHERE kind LIKE 'SFEER_%'
+      )
+      DELETE FROM product_pictures p
+      USING ranked r
+      WHERE p.ctid = r.ctid
+        AND r.rn > 1;
+    `);
+
+    const after = await pool.query(`
+      SELECT COUNT(*)::int AS total
+      FROM product_pictures
+      WHERE kind LIKE 'SFEER_%'
+    `);
+
+    res.json({ ok: true, before: before.rows[0].total, after: after.rows[0].total });
+  } catch (err) {
+    console.error("db/cleanup-sfeer-duplicates:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+/* =========================================================
    Health
    ========================================================= */
 app.get("/health", (req, res) => {
@@ -441,49 +479,62 @@ app.post("/sync/products", async (req, res) => {
   let upserted = 0;
 
   try {
-    await forEachAfasRow(connectorId, { take }, async (r) => {
-      const itemcode = r.Itemcode ?? r.itemcode ?? r.Code ?? r.code ?? null;
-      if (!itemcode) return;
+    // paging over AFAS connector
+    let skip = 0;
+    while (true) {
+      const data = await fetchAfasWithRetry(connectorId, { skip, take });
+      const rows = data?.rows || [];
+      if (!rows.length) break;
 
-      const ecommerce_available = parseBool(r["E-commerce_beschikbaar"] ?? r.Ecommerce ?? r.ecommerce_available);
+      for (const r of rows) {
+        const itemcode = r.Itemcode ?? r.itemcode ?? r.Code ?? r.code ?? null;
+        if (!itemcode) continue;
 
-      await pool.query(
-        `
-        INSERT INTO products (
-          itemcode, description_eng, ean, price, available_stock,
-          ecommerce_available,
-          outercarton, innercarton, unit,
-          raw, updated_at
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
-        ON CONFLICT (itemcode) DO UPDATE SET
-          description_eng = EXCLUDED.description_eng,
-          ean = EXCLUDED.ean,
-          price = EXCLUDED.price,
-          available_stock = EXCLUDED.available_stock,
-          ecommerce_available = EXCLUDED.ecommerce_available,
-          outercarton = EXCLUDED.outercarton,
-          innercarton = EXCLUDED.innercarton,
-          unit = EXCLUDED.unit,
-          raw = EXCLUDED.raw,
-          updated_at = NOW()
-        `,
-        [
-          String(itemcode),
-          r.OMSCHRIJVING_ENG ?? r.DescriptionENG ?? null,
-          r["EAN_product__Opgeschoonde_barcode_"] ?? r.EAN ?? r.ean ?? null,
-          r.Prijs ?? r.Price ?? null,
-          r.Beschikbare_voorraad ?? r.AvailableStock ?? null,
-          ecommerce_available,
-          r.OUTERCARTON ?? r.outercarton ?? null,
-          r.INNERCARTON ?? r.innercarton ?? null,
-          r.UNIT ?? r.unit ?? null,
-          r,
-        ]
-      );
+        const ecommerce_available = parseBool(
+          r["E-commerce_beschikbaar"] ?? r.Ecommerce ?? r.ecommerce_available
+        );
 
-      upserted += 1;
-    });
+        await pool.query(
+          `
+          INSERT INTO products (
+            itemcode, description_eng, ean, price, available_stock,
+            ecommerce_available,
+            outercarton, innercarton, unit,
+            raw, updated_at
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+          ON CONFLICT (itemcode) DO UPDATE SET
+            description_eng = EXCLUDED.description_eng,
+            ean = EXCLUDED.ean,
+            price = EXCLUDED.price,
+            available_stock = EXCLUDED.available_stock,
+            ecommerce_available = EXCLUDED.ecommerce_available,
+            outercarton = EXCLUDED.outercarton,
+            innercarton = EXCLUDED.innercarton,
+            unit = EXCLUDED.unit,
+            raw = EXCLUDED.raw,
+            updated_at = NOW()
+          `,
+          [
+            String(itemcode),
+            r.OMSCHRIJVING_ENG ?? r.DescriptionENG ?? null,
+            r["EAN_product__Opgeschoonde_barcode_"] ?? r.EAN ?? r.ean ?? null,
+            r.Prijs ?? r.Price ?? null,
+            r.Beschikbare_voorraad ?? r.AvailableStock ?? null,
+            ecommerce_available,
+            r.OUTERCARTON ?? r.outercarton ?? null,
+            r.INNERCARTON ?? r.innercarton ?? null,
+            r.UNIT ?? r.unit ?? null,
+            r,
+          ]
+        );
+
+        upserted += 1;
+      }
+
+      skip += rows.length;
+      if (rows.length < take) break;
+    }
 
     res.json({ ok: true, connectorId, upserted });
   } catch (err) {
@@ -493,7 +544,7 @@ app.post("/sync/products", async (req, res) => {
 });
 
 /* =========================================================
-   STEP 1 — MAIN manifest (product-driven, truth = Items_Pictures_app per item)
+   STEP 1 — MAIN manifest (UNCHANGED logic)
    ========================================================= */
 async function upsertMainPictureManifest(itemcode, afasRow) {
   const filename = afasRow?.Bestandsnaam_MAIN ?? null;
@@ -557,6 +608,7 @@ async function upsertMainPictureManifest(itemcode, afasRow) {
   return { ok: true, picture_id };
 }
 
+// POST /sync/pictures-main-from-products?key=...&limit=200&offset=0
 app.post("/sync/pictures-main-from-products", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
@@ -624,18 +676,27 @@ app.post("/sync/pictures-main-from-products", async (req, res) => {
 });
 
 /* =========================================================
-   STEP 1B — SFEER manifest (product-driven, truth = Items_Pictures_app per item)
-   IMPORTANT: MAIN logic untouched.
+   STEP 1B — SFEER manifest (FIXED: 1 record per slot, no duplicates)
+   - picture_id is slot-stable: sha1(itemcode:kind)
+   - raw stores hashes only (no base64)
    ========================================================= */
-async function upsertSfeerPictureManifest(itemcode, kind, sort_order, afasRow) {
+async function upsertSfeerSlotManifest(itemcode, kind, sort_order, afasRow) {
   const b64Field = KIND_TO_AFAS_B64_FIELD[kind];
   if (!b64Field) return { ok: false, reason: "unknown_kind" };
 
   const b64 = normalizeBase64(afasRow?.[b64Field]);
   if (!b64) return { ok: false, reason: "no_b64" };
 
-  const contentHash = sha1(b64);
-  const picture_id = sha1(`${itemcode}:${kind}:${contentHash}`);
+  const content_hash = sha1(b64);
+
+  // SLOT-STABLE id => max 1 row per product per slot
+  const picture_id = sha1(`${itemcode}:${kind}`);
+
+  const rawMeta = {
+    source_field: b64Field,
+    content_hash, // current AFAS content hash
+    // uploaded_hash will be set by upload job after successful upload
+  };
 
   await pool.query(
     `
@@ -650,15 +711,18 @@ async function upsertSfeerPictureManifest(itemcode, kind, sort_order, afasRow) {
       sort_order = EXCLUDED.sort_order,
       raw = EXCLUDED.raw,
       updated_at = NOW(),
-      needs_fetch = (product_pictures.cdn_url IS NULL) OR (product_pictures.needs_fetch = true)
+      needs_fetch =
+        (product_pictures.cdn_url IS NULL)
+        OR (product_pictures.raw->>'content_hash' IS DISTINCT FROM EXCLUDED.raw->>'content_hash')
+        OR (product_pictures.raw->>'uploaded_hash' IS DISTINCT FROM EXCLUDED.raw->>'content_hash')
     `,
-    [String(itemcode), String(picture_id), String(kind), Number(sort_order) || 0, afasRow]
+    [String(itemcode), String(picture_id), String(kind), Number(sort_order) || 0, rawMeta]
   );
 
-  return { ok: true, picture_id };
+  return { ok: true, picture_id, content_hash };
 }
 
-app.post("/sync/pictures-sfeer-manifest", async (req, res) => {
+async function handleSfeerManifest(req, res) {
   if (!requireSetupKey(req, res)) return;
 
   const limit = Math.min(2000, Math.max(1, Number(req.query.limit || 200)));
@@ -681,9 +745,9 @@ app.post("/sync/pictures-sfeer-manifest", async (req, res) => {
     let missingInAfas = 0;
     let foundAfas = 0;
 
-    let sfeerUpserts = 0;
-    let sfeerSlotsWithB64 = 0;
-    let sfeerSlotsNoB64 = 0;
+    let slotsWithB64 = 0;
+    let slotsNoB64 = 0;
+    let upserts = 0;
 
     for (const row of pr.rows) {
       const itemcode = row.itemcode;
@@ -715,16 +779,14 @@ app.post("/sync/pictures-sfeer-manifest", async (req, res) => {
       for (const s of slots) {
         const b64Field = KIND_TO_AFAS_B64_FIELD[s.kind];
         const b64 = normalizeBase64(afasRow?.[b64Field]);
-
         if (!b64) {
-          sfeerSlotsNoB64 += 1;
+          slotsNoB64 += 1;
           continue;
         }
+        slotsWithB64 += 1;
 
-        sfeerSlotsWithB64 += 1;
-
-        const r = await upsertSfeerPictureManifest(itemcode, s.kind, s.sort, afasRow);
-        if (r.ok) sfeerUpserts += 1;
+        const r = await upsertSfeerSlotManifest(itemcode, s.kind, s.sort, afasRow);
+        if (r.ok) upserts += 1;
       }
     }
 
@@ -736,18 +798,24 @@ app.post("/sync/pictures-sfeer-manifest", async (req, res) => {
       skippedA,
       foundAfas,
       missingInAfas,
-      sfeerSlotsWithB64,
-      sfeerSlotsNoB64,
-      sfeerUpserts,
+      sfeerSlotsWithB64: slotsWithB64,
+      sfeerSlotsNoB64: slotsNoB64,
+      sfeerUpserts: upserts,
     });
   } catch (err) {
     console.error("sync/pictures-sfeer-manifest:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
-});
+}
+
+// POST for scripts + GET for browser clicks
+app.post("/sync/pictures-sfeer-manifest", handleSfeerManifest);
+app.get("/sync/pictures-sfeer-manifest", handleSfeerManifest);
 
 /* =========================================================
    STEP 2 — Upload job (base64 from Items_Pictures_app -> R2)
+   - For SFEER: overwrites object when content_hash changed
+   - Tracks raw.uploaded_hash = content_hash on success
    ========================================================= */
 function parseKindsParam(kindsParam) {
   if (!kindsParam) return ["MAIN"];
@@ -757,6 +825,7 @@ function parseKindsParam(kindsParam) {
     .filter(Boolean);
 }
 
+// POST /sync/upload-pictures-to-r2?key=...&limit=50&kinds=MAIN&concurrency=1
 app.post("/sync/upload-pictures-to-r2", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
@@ -768,9 +837,10 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
     if (!r2) throw new Error("R2 not configured");
     if (!R2_PUBLIC_BASE_URL) throw new Error("Missing R2_PUBLIC_BASE_URL");
 
+    // include raw so we can read uploaded_hash
     const { rows } = await pool.query(
       `
-      SELECT itemcode, picture_id, kind, filename, mime
+      SELECT itemcode, picture_id, kind, filename, mime, raw, cdn_url
       FROM product_pictures
       WHERE needs_fetch = true
         AND kind = ANY($1)
@@ -783,6 +853,7 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
     let uploaded = 0;
     let skippedNoAfas = 0;
     let skippedNoB64 = 0;
+    let usedExisting = 0;
     let failed = 0;
 
     await runWithConcurrency(rows, concurrency, async (pic) => {
@@ -802,7 +873,7 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
         const afasRow = await fetchAfasPicturesRowByItemcode(itemcode);
         if (!afasRow) {
           skippedNoAfas += 1;
-          return;
+          return; // keep needs_fetch=true
         }
 
         const b64 = normalizeBase64(afasRow[b64Field]);
@@ -815,33 +886,70 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
           return;
         }
 
+        const content_hash = sha1(b64);
+        const uploaded_hash = pic?.raw?.uploaded_hash ?? null;
+
         const mime =
-          pic.mime || guessMimeFromFilename(pic.filename) || guessMimeFromBase64(b64) || "image/jpeg";
+          pic.mime ||
+          guessMimeFromFilename(pic.filename) ||
+          guessMimeFromBase64(b64) ||
+          "image/jpeg";
         const ext = extFromMime(mime);
         const buf = Buffer.from(b64, "base64");
 
+        // Required key scheme
         const key = `products/${itemcode}/${kind.toLowerCase()}_${pic.picture_id}.${ext}`;
 
-        const exists = await headR2(key);
-        const cdnUrl = exists ? publicUrlForKey(key) : await uploadToR2WithRetry({ key, body: buf, contentType: mime });
+        // If this exact content was already uploaded and object exists, we can just set cdn_url
+        // Otherwise we overwrite upload to ensure updated photos are pushed.
+        let cdnUrl = null;
+
+        if (uploaded_hash && uploaded_hash === content_hash) {
+          const exists = await headR2(key);
+          if (exists) {
+            cdnUrl = publicUrlForKey(key);
+            usedExisting += 1;
+          }
+        }
+
+        if (!cdnUrl) {
+          cdnUrl = await uploadToR2WithRetry({ key, body: buf, contentType: mime });
+          uploaded += 1;
+        }
+
+        const newRaw = {
+          ...(pic.raw || {}),
+          uploaded_hash: content_hash,
+          content_hash: content_hash,
+          source_field: b64Field,
+        };
 
         await pool.query(
           `
           UPDATE product_pictures
-          SET cdn_url=$1, needs_fetch=false, updated_at=NOW()
+          SET cdn_url=$1, needs_fetch=false, raw=$4, updated_at=NOW()
           WHERE itemcode=$2 AND picture_id=$3
           `,
-          [cdnUrl, itemcode, pic.picture_id]
+          [cdnUrl, itemcode, pic.picture_id, newRaw]
         );
-
-        uploaded += 1;
       } catch (e) {
         failed += 1;
         console.error("upload failed:", { itemcode, kind, err: e?.message || String(e) });
       }
     });
 
-    res.json({ ok: true, kinds, limit, concurrency, queued: rows.length, uploaded, skippedNoAfas, skippedNoB64, failed });
+    res.json({
+      ok: true,
+      kinds,
+      limit,
+      concurrency,
+      queued: rows.length,
+      uploaded,
+      usedExisting,
+      skippedNoAfas,
+      skippedNoB64,
+      failed,
+    });
   } catch (err) {
     console.error("sync/upload-pictures-to-r2:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
@@ -979,47 +1087,18 @@ app.get("/products/by-ean/:ean", async (req, res) => {
 });
 
 /* =========================================================
-   Debug (safe)
+   Debug
    ========================================================= */
-app.get("/debug/pictures/db-counts", async (req, res) => {
-  try {
-    const a = await pool.query(`
-      SELECT COUNT(*)::int AS ecommerce_products
-      FROM products
-      WHERE ecommerce_available = true
-    `);
-
-    const b = await pool.query(`
-      SELECT
-        COUNT(*) FILTER (WHERE kind='MAIN')::int AS main_records_total,
-        COUNT(*) FILTER (WHERE kind='MAIN' AND cdn_url IS NOT NULL)::int AS main_with_cdn,
-        COUNT(*) FILTER (WHERE kind='MAIN' AND cdn_url IS NULL)::int AS main_missing_cdn
-      FROM product_pictures
-    `);
-
-    const c = await pool.query(`
-      SELECT COUNT(*)::int AS ecommerce_missing_main_record
-      FROM products p
-      LEFT JOIN product_pictures pp
-        ON pp.itemcode = p.itemcode AND pp.kind='MAIN'
-      WHERE p.ecommerce_available = true
-        AND pp.itemcode IS NULL
-    `);
-
-    res.json({ ok: true, ...a.rows[0], ...b.rows[0], ...c.rows[0] });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message || String(err) });
-  }
-});
-
 app.get("/debug/pictures/sfeer-counts", async (req, res) => {
   try {
     const a = await pool.query(`
       SELECT
-        COUNT(*) FILTER (WHERE kind LIKE 'SFEER_%')::int AS sfeer_records_total,
-        COUNT(*) FILTER (WHERE kind LIKE 'SFEER_%' AND cdn_url IS NOT NULL)::int AS sfeer_with_cdn,
-        COUNT(*) FILTER (WHERE kind LIKE 'SFEER_%' AND cdn_url IS NULL)::int AS sfeer_missing_cdn
+        COUNT(*)::int AS sfeer_records_total,
+        COUNT(*) FILTER (WHERE cdn_url IS NOT NULL)::int AS sfeer_with_cdn,
+        COUNT(*) FILTER (WHERE cdn_url IS NULL)::int AS sfeer_missing_cdn,
+        COUNT(DISTINCT (itemcode, kind))::int AS sfeer_unique_slots
       FROM product_pictures
+      WHERE kind LIKE 'SFEER_%'
     `);
 
     const b = await pool.query(`
