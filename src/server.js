@@ -184,6 +184,18 @@ function parseBool(v) {
   return ["true", "1", "yes", "ja"].includes(s);
 }
 
+function toNumberOrNull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function toDateOrNull(v) {
+  if (!v) return null;
+  // AFAS sometimes returns "YYYY-MM-DD" or ISO; PG DATE accepts both
+  return String(v);
+}
+
 /* =========================================================
    Field mapping (must exist before SFEER code uses it)
    ========================================================= */
@@ -302,7 +314,6 @@ async function uploadToR2({ key, body, contentType }) {
   if (!r2) throw new Error("R2 not configured");
   if (!R2_PUBLIC_BASE_URL) throw new Error("Missing R2_PUBLIC_BASE_URL");
 
-  // PutObject overwrites existing object (important for changed photos)
   await r2.send(
     new PutObjectCommand({
       Bucket: R2_BUCKET,
@@ -381,6 +392,7 @@ app.post("/db/setup-afas-extra", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   try {
+    // pictures
     await pool.query(`
       CREATE TABLE IF NOT EXISTS product_pictures (
         itemcode TEXT NOT NULL,
@@ -404,23 +416,31 @@ app.post("/db/setup-afas-extra", async (req, res) => {
       ON product_pictures (itemcode, kind, sort_order, picture_id);
     `);
 
+    // stock
     await pool.query(`
-  CREATE TABLE IF NOT EXISTS product_stock (
-    itemcode TEXT PRIMARY KEY,
-    available_stock NUMERIC NULL,
-    economic_stock NUMERIC NULL,
-    on_order NUMERIC NULL,
-    arrival_date DATE NULL,
-    updated_at TIMESTAMP DEFAULT NOW(),
-    raw JSONB NULL
-  );
-`);
+      CREATE TABLE IF NOT EXISTS product_stock (
+        itemcode TEXT PRIMARY KEY,
+        available_stock NUMERIC NULL,
+        economic_stock NUMERIC NULL,
+        on_order NUMERIC NULL,
+        arrival_date DATE NULL,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        raw JSONB NULL
+      );
+    `);
 
-await pool.query(`
-  CREATE INDEX IF NOT EXISTS idx_product_stock_updated_at
-  ON product_stock(updated_at);
-`);
+    // in case table existed with missing columns (this prevents your "column does not exist" issue)
+    await pool.query(`
+      ALTER TABLE product_stock
+        ADD COLUMN IF NOT EXISTS economic_stock NUMERIC NULL,
+        ADD COLUMN IF NOT EXISTS on_order NUMERIC NULL,
+        ADD COLUMN IF NOT EXISTS arrival_date DATE NULL;
+    `);
 
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_product_stock_updated_at
+      ON product_stock(updated_at);
+    `);
 
     res.json({ ok: true, message: "product_pictures + product_stock ready" });
   } catch (err) {
@@ -431,9 +451,7 @@ await pool.query(`
 
 /* =========================================================
    One-time cleanup: remove duplicates per (itemcode, kind) for SFEER
-   Keeps the row with cdn_url if possible, otherwise the newest.
    ========================================================= */
-// POST /db/cleanup-sfeer-duplicates?key=...
 app.post("/db/cleanup-sfeer-duplicates", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
@@ -497,7 +515,6 @@ app.post("/sync/products", async (req, res) => {
   let upserted = 0;
 
   try {
-    // paging over AFAS connector
     let skip = 0;
     while (true) {
       const data = await fetchAfasWithRetry(connectorId, { skip, take });
@@ -561,7 +578,14 @@ app.post("/sync/products", async (req, res) => {
   }
 });
 
-// POST /sync/stock?key=...&connectorId=Items_stock_app
+/* =========================================================
+   Sync stock (Items_stock_app)
+   AFAS fields (from your screenshot):
+   - Beschik_vrrd
+   - In_bestelling
+   - Aankomst_datum
+   - Eco_vrrd
+   ========================================================= */
 app.post("/sync/stock", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
@@ -579,7 +603,7 @@ app.post("/sync/stock", async (req, res) => {
       if (!rows.length) break;
 
       for (const r of rows) {
-        const itemcode = r.Itemcode ?? r.itemcode ?? r.Code ?? r.code ?? null;
+        const itemcode = r.Itemcode ?? r.itemcode ?? r.Itemcode ?? r.Code ?? r.code ?? null;
         if (!itemcode) {
           skippedNoItemcode += 1;
           continue;
@@ -607,10 +631,10 @@ app.post("/sync/stock", async (req, res) => {
           `,
           [
             String(itemcode),
-            r.Beschik_vrrd ?? null,
-            r.Eco_vrrd ?? null,
-            r.In_bestelling ?? null,
-            r.Aankomst_datum ?? null,
+            toNumberOrNull(r.Beschik_vrrd ?? r.Beschik_vrrd ?? null),
+            toNumberOrNull(r.Eco_vrrd ?? null),
+            toNumberOrNull(r.In_bestelling ?? null),
+            toDateOrNull(r.Aankomst_datum ?? null),
             r,
           ]
         );
@@ -630,7 +654,7 @@ app.post("/sync/stock", async (req, res) => {
 });
 
 /* =========================================================
-   STEP 1 — MAIN manifest (UNCHANGED logic)
+   STEP 1 — MAIN manifest (unchanged)
    ========================================================= */
 async function upsertMainPictureManifest(itemcode, afasRow) {
   const filename = afasRow?.Bestandsnaam_MAIN ?? null;
@@ -694,7 +718,6 @@ async function upsertMainPictureManifest(itemcode, afasRow) {
   return { ok: true, picture_id };
 }
 
-// POST /sync/pictures-main-from-products?key=...&limit=200&offset=0
 app.post("/sync/pictures-main-from-products", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
@@ -762,9 +785,7 @@ app.post("/sync/pictures-main-from-products", async (req, res) => {
 });
 
 /* =========================================================
-   STEP 1B — SFEER manifest (FIXED: 1 record per slot, no duplicates)
-   - picture_id is slot-stable: sha1(itemcode:kind)
-   - raw stores hashes only (no base64)
+   STEP 1B — SFEER manifest (slot-stable, no duplicates)
    ========================================================= */
 async function upsertSfeerSlotManifest(itemcode, kind, sort_order, afasRow) {
   const b64Field = KIND_TO_AFAS_B64_FIELD[kind];
@@ -774,14 +795,11 @@ async function upsertSfeerSlotManifest(itemcode, kind, sort_order, afasRow) {
   if (!b64) return { ok: false, reason: "no_b64" };
 
   const content_hash = sha1(b64);
-
-  // SLOT-STABLE id => max 1 row per product per slot
-  const picture_id = sha1(`${itemcode}:${kind}`);
+  const picture_id = sha1(`${itemcode}:${kind}`); // SLOT-STABLE
 
   const rawMeta = {
     source_field: b64Field,
-    content_hash, // current AFAS content hash
-    // uploaded_hash will be set by upload job after successful upload
+    content_hash,
   };
 
   await pool.query(
@@ -894,14 +912,11 @@ async function handleSfeerManifest(req, res) {
   }
 }
 
-// POST for scripts + GET for browser clicks
 app.post("/sync/pictures-sfeer-manifest", handleSfeerManifest);
 app.get("/sync/pictures-sfeer-manifest", handleSfeerManifest);
 
 /* =========================================================
    STEP 2 — Upload job (base64 from Items_Pictures_app -> R2)
-   - For SFEER: overwrites object when content_hash changed
-   - Tracks raw.uploaded_hash = content_hash on success
    ========================================================= */
 function parseKindsParam(kindsParam) {
   if (!kindsParam) return ["MAIN"];
@@ -911,7 +926,6 @@ function parseKindsParam(kindsParam) {
     .filter(Boolean);
 }
 
-// POST /sync/upload-pictures-to-r2?key=...&limit=50&kinds=MAIN&concurrency=1
 app.post("/sync/upload-pictures-to-r2", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
@@ -923,7 +937,6 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
     if (!r2) throw new Error("R2 not configured");
     if (!R2_PUBLIC_BASE_URL) throw new Error("Missing R2_PUBLIC_BASE_URL");
 
-    // include raw so we can read uploaded_hash
     const { rows } = await pool.query(
       `
       SELECT itemcode, picture_id, kind, filename, mime, raw, cdn_url
@@ -959,7 +972,7 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
         const afasRow = await fetchAfasPicturesRowByItemcode(itemcode);
         if (!afasRow) {
           skippedNoAfas += 1;
-          return; // keep needs_fetch=true
+          return;
         }
 
         const b64 = normalizeBase64(afasRow[b64Field]);
@@ -976,18 +989,12 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
         const uploaded_hash = pic?.raw?.uploaded_hash ?? null;
 
         const mime =
-          pic.mime ||
-          guessMimeFromFilename(pic.filename) ||
-          guessMimeFromBase64(b64) ||
-          "image/jpeg";
+          pic.mime || guessMimeFromFilename(pic.filename) || guessMimeFromBase64(b64) || "image/jpeg";
         const ext = extFromMime(mime);
         const buf = Buffer.from(b64, "base64");
 
-        // Required key scheme
         const key = `products/${itemcode}/${kind.toLowerCase()}_${pic.picture_id}.${ext}`;
 
-        // If this exact content was already uploaded and object exists, we can just set cdn_url
-        // Otherwise we overwrite upload to ensure updated photos are pushed.
         let cdnUrl = null;
 
         if (uploaded_hash && uploaded_hash === content_hash) {
@@ -1006,7 +1013,7 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
         const newRaw = {
           ...(pic.raw || {}),
           uploaded_hash: content_hash,
-          content_hash: content_hash,
+          content_hash,
           source_field: b64Field,
         };
 
@@ -1043,8 +1050,10 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
 });
 
 /* =========================================================
-   STEP 3 — API (CDN URLs only)
+   API
    ========================================================= */
+
+// products list (kept as-is, stock can be added later)
 app.get("/products", async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
   const offset = Math.max(0, Number(req.query.offset || 0));
@@ -1084,97 +1093,10 @@ app.get("/products", async (req, res) => {
   }
 });
 
-app.get("/products/:itemcode", async (req, res) => {
-  const itemcode = req.params.itemcode;
-
-  try {
-    const q = `
-      SELECT
-        p.itemcode,
-        p.description_eng,
-        p.ean,
-        p.price,
-        p.available_stock,
-        p.outercarton,
-        p.innercarton,
-        p.unit,
-        COALESCE((
-          SELECT pp.cdn_url
-          FROM product_pictures pp
-          WHERE pp.itemcode = p.itemcode
-            AND pp.cdn_url IS NOT NULL
-          ORDER BY
-            CASE WHEN pp.kind='MAIN' THEN 0 ELSE 1 END,
-            COALESCE(pp.sort_order, 999),
-            pp.picture_id
-          LIMIT 1
-        ), '') AS image_url,
-        COALESCE((
-          SELECT json_agg(pp.cdn_url ORDER BY
-            CASE WHEN pp.kind='MAIN' THEN 0 ELSE 1 END,
-            COALESCE(pp.sort_order, 999),
-            pp.picture_id
-          )
-          FROM product_pictures pp
-          WHERE pp.itemcode = p.itemcode
-            AND pp.cdn_url IS NOT NULL
-        ), '[]'::json) AS image_urls
-      FROM products p
-      WHERE p.itemcode = $1
-        AND p.ecommerce_available = true
-      LIMIT 1
-    `;
-    const { rows } = await pool.query(q, [itemcode]);
-    if (!rows.length) return res.status(404).json({ ok: false, error: "Not found" });
-    res.json({ ok: true, data: rows[0] });
-  } catch (err) {
-    console.error("GET /products/:itemcode:", err);
-    res.status(500).json({ ok: false, error: err.message || String(err) });
-  }
-});
-
-app.get("/products/by-ean/:ean", async (req, res) => {
-  const ean = req.params.ean;
-
-  try {
-    const q = `
-      SELECT
-        p.itemcode,
-        p.description_eng,
-        p.ean,
-        p.price,
-        p.available_stock,
-        p.outercarton,
-        p.innercarton,
-        p.unit,
-        COALESCE((
-          SELECT pp.cdn_url
-          FROM product_pictures pp
-          WHERE pp.itemcode = p.itemcode
-            AND pp.cdn_url IS NOT NULL
-          ORDER BY
-            CASE WHEN pp.kind='MAIN' THEN 0 ELSE 1 END,
-            COALESCE(pp.sort_order, 999),
-            pp.picture_id
-          LIMIT 1
-        ), '') AS image_url
-      FROM products p
-      WHERE p.ean = $1
-        AND p.ecommerce_available = true
-      LIMIT 1
-    `;
-    const { rows } = await pool.query(q, [ean]);
-    if (!rows.length) return res.status(404).json({ ok: false, error: "Unknown EAN" });
-    res.json({ ok: true, data: rows[0] });
-  } catch (err) {
-    console.error("GET /products/by-ean:", err);
-    res.status(500).json({ ok: false, error: err.message || String(err) });
-  }
-});
-
 /* =========================================================
    Debug
    ========================================================= */
+
 app.get("/debug/pictures/sfeer-counts", async (req, res) => {
   try {
     const a = await pool.query(`
@@ -1219,7 +1141,6 @@ app.get("/debug/stock-schema", async (req, res) => {
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
-
 
 /* =========================================================
    Error handler
