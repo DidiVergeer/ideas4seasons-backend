@@ -561,6 +561,74 @@ app.post("/sync/products", async (req, res) => {
   }
 });
 
+// POST /sync/stock?key=...&connectorId=Items_stock_app
+app.post("/sync/stock", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const connectorId = req.query.connectorId || "Items_stock_app";
+  const take = Number(req.query.take || process.env.AFAS_TAKE_DEFAULT || 200);
+
+  let upserted = 0;
+  let skippedNoItemcode = 0;
+
+  try {
+    let skip = 0;
+    while (true) {
+      const data = await fetchAfasWithRetry(connectorId, { skip, take });
+      const rows = data?.rows || [];
+      if (!rows.length) break;
+
+      for (const r of rows) {
+        const itemcode = r.Itemcode ?? r.itemcode ?? r.Code ?? r.code ?? null;
+        if (!itemcode) {
+          skippedNoItemcode += 1;
+          continue;
+        }
+
+        await pool.query(
+          `
+          INSERT INTO product_stock (
+            itemcode,
+            available_stock,
+            economic_stock,
+            on_order,
+            arrival_date,
+            raw,
+            updated_at
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,NOW())
+          ON CONFLICT (itemcode) DO UPDATE SET
+            available_stock = EXCLUDED.available_stock,
+            economic_stock  = EXCLUDED.economic_stock,
+            on_order        = EXCLUDED.on_order,
+            arrival_date    = EXCLUDED.arrival_date,
+            raw             = EXCLUDED.raw,
+            updated_at      = NOW()
+          `,
+          [
+            String(itemcode),
+            r.Beschik_vrrd ?? null,
+            r.Eco_vrrd ?? null,
+            r.In_bestelling ?? null,
+            r.Aankomst_datum ?? null,
+            r,
+          ]
+        );
+
+        upserted += 1;
+      }
+
+      skip += rows.length;
+      if (rows.length < take) break;
+    }
+
+    res.json({ ok: true, connectorId, upserted, skippedNoItemcode });
+  } catch (err) {
+    console.error("sync/stock:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 /* =========================================================
    STEP 1 — MAIN manifest (UNCHANGED logic)
    ========================================================= */
