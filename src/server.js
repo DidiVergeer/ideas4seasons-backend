@@ -185,15 +185,24 @@ function parseBool(v) {
 }
 
 function toNumberOrNull(v) {
-  if (v === null || v === undefined || v === "") return null;
-  const n = Number(v);
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+
+  const s = String(v).trim();
+  if (!s) return null;
+
+  // Allow "12,34" and "12.34" and "1 234,56"
+  const normalized = s.replace(/\s+/g, "").replace(",", ".");
+  const n = Number(normalized);
   return Number.isFinite(n) ? n : null;
 }
 
 function toDateOrNull(v) {
-  if (!v) return null;
-  // AFAS sometimes returns "YYYY-MM-DD" or ISO; PG DATE accepts both
-  return String(v);
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  // Keep as ISO-like string; PG DATE accepts 'YYYY-MM-DD' and most ISO formats
+  return s;
 }
 
 /* =========================================================
@@ -416,7 +425,7 @@ app.post("/db/setup-afas-extra", async (req, res) => {
       ON product_pictures (itemcode, kind, sort_order, picture_id);
     `);
 
-    // stock
+    // stock (non-destructive basic creation; rebuild endpoint below is the safe "drop & create")
     await pool.query(`
       CREATE TABLE IF NOT EXISTS product_stock (
         itemcode TEXT PRIMARY KEY,
@@ -424,49 +433,19 @@ app.post("/db/setup-afas-extra", async (req, res) => {
         economic_stock NUMERIC NULL,
         on_order NUMERIC NULL,
         arrival_date DATE NULL,
-        updated_at TIMESTAMP DEFAULT NOW(),
-        raw JSONB NULL
+        raw JSONB NULL,
+        updated_at TIMESTAMP DEFAULT NOW()
       );
     `);
 
-    // 1) verwijder dubbele itemcodes (houd nieuwste)
-await pool.query(`
-  WITH ranked AS (
-    SELECT
-      ctid,
-      itemcode,
-      updated_at,
-      ROW_NUMBER() OVER (PARTITION BY itemcode ORDER BY updated_at DESC) AS rn
-    FROM product_stock
-  )
-  DELETE FROM product_stock ps
-  USING ranked r
-  WHERE ps.ctid = r.ctid
-    AND r.rn > 1;
-`);
-
-// 2) voeg UNIQUE constraint toe op itemcode (als die nog niet bestaat)
-await pool.query(`
-  DO $$
-  BEGIN
-    IF NOT EXISTS (
-      SELECT 1
-      FROM pg_constraint
-      WHERE conname = 'product_stock_itemcode_unique'
-    ) THEN
-      ALTER TABLE product_stock
-      ADD CONSTRAINT product_stock_itemcode_unique UNIQUE (itemcode);
-    END IF;
-  END $$;
-`);
-
-
-    // in case table existed with missing columns (this prevents your "column does not exist" issue)
     await pool.query(`
       ALTER TABLE product_stock
+        ADD COLUMN IF NOT EXISTS available_stock NUMERIC NULL,
         ADD COLUMN IF NOT EXISTS economic_stock NUMERIC NULL,
         ADD COLUMN IF NOT EXISTS on_order NUMERIC NULL,
-        ADD COLUMN IF NOT EXISTS arrival_date DATE NULL;
+        ADD COLUMN IF NOT EXISTS arrival_date DATE NULL,
+        ADD COLUMN IF NOT EXISTS raw JSONB NULL,
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
     `);
 
     await pool.query(`
@@ -477,6 +456,40 @@ await pool.query(`
     res.json({ ok: true, message: "product_pictures + product_stock ready" });
   } catch (err) {
     console.error("db/setup-afas-extra:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+/* =========================================================
+   NEW: SAFE stock rebuild (DROP + CREATE clean schema)
+   ========================================================= */
+// GET /db/rebuild-stock?key=...
+app.get("/db/rebuild-stock", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  try {
+    await pool.query(`DROP TABLE IF EXISTS product_stock;`);
+
+    await pool.query(`
+      CREATE TABLE product_stock (
+        itemcode        TEXT PRIMARY KEY,
+        available_stock NUMERIC NULL,
+        economic_stock  NUMERIC NULL,
+        on_order        NUMERIC NULL,
+        arrival_date    DATE NULL,
+        raw             JSONB NULL,
+        updated_at      TIMESTAMP NULL
+      );
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_product_stock_updated_at
+      ON product_stock(updated_at);
+    `);
+
+    res.json({ ok: true, message: "product_stock rebuilt (clean schema)" });
+  } catch (err) {
+    console.error("db/rebuild-stock:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
@@ -612,11 +625,20 @@ app.post("/sync/products", async (req, res) => {
 
 /* =========================================================
    Sync stock (Items_stock_app)
-   AFAS fields (from your screenshot):
+   Only AFAS fields:
+   - Itemcode
    - Beschik_vrrd
    - In_bestelling
    - Aankomst_datum
    - Eco_vrrd
+   DB columns:
+   - itemcode (PK)
+   - available_stock
+   - economic_stock
+   - on_order
+   - arrival_date
+   - raw
+   - updated_at
    ========================================================= */
 app.post("/sync/stock", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
@@ -635,11 +657,17 @@ app.post("/sync/stock", async (req, res) => {
       if (!rows.length) break;
 
       for (const r of rows) {
-        const itemcode = r.Itemcode ?? r.itemcode ?? r.Itemcode ?? r.Code ?? r.code ?? null;
+        const itemcode = r.Itemcode ?? r.itemcode ?? r.Code ?? r.code ?? null;
         if (!itemcode) {
           skippedNoItemcode += 1;
           continue;
         }
+
+        // Only the 5 AFAS fields + keep full raw row
+        const available_stock = toNumberOrNull(r.Beschik_vrrd);
+        const on_order = toNumberOrNull(r.In_bestelling);
+        const arrival_date = toDateOrNull(r.Aankomst_datum);
+        const economic_stock = toNumberOrNull(r.Eco_vrrd);
 
         await pool.query(
           `
@@ -661,14 +689,7 @@ app.post("/sync/stock", async (req, res) => {
             raw             = EXCLUDED.raw,
             updated_at      = NOW()
           `,
-          [
-            String(itemcode),
-            toNumberOrNull(r.Beschik_vrrd ?? r.Beschik_vrrd ?? null),
-            toNumberOrNull(r.Eco_vrrd ?? null),
-            toNumberOrNull(r.In_bestelling ?? null),
-            toDateOrNull(r.Aankomst_datum ?? null),
-            r,
-          ]
+          [String(itemcode), available_stock, economic_stock, on_order, arrival_date, r]
         );
 
         upserted += 1;
@@ -1162,13 +1183,46 @@ app.get("/debug/stock-schema", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   try {
-    const r = await pool.query(`
-      SELECT column_name, data_type
+    const cols = await pool.query(
+      `
+      SELECT
+        column_name,
+        data_type,
+        is_nullable,
+        ordinal_position
       FROM information_schema.columns
-      WHERE table_name = 'product_stock'
+      WHERE table_schema = 'public'
+        AND table_name = 'product_stock'
       ORDER BY ordinal_position
-    `);
-    res.json({ ok: true, columns: r.rows });
+      `
+    );
+
+    const constraints = await pool.query(
+      `
+      SELECT
+        tc.constraint_type,
+        tc.constraint_name,
+        kcu.column_name
+      FROM information_schema.table_constraints tc
+      LEFT JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name
+       AND tc.table_schema = kcu.table_schema
+       AND tc.table_name = kcu.table_name
+      WHERE tc.table_schema = 'public'
+        AND tc.table_name = 'product_stock'
+      ORDER BY tc.constraint_type, tc.constraint_name, kcu.ordinal_position
+      `
+    );
+
+    const counts = await pool.query(`SELECT COUNT(*)::int AS total FROM product_stock;`);
+
+    res.json({
+      ok: true,
+      table: "product_stock",
+      total: counts.rows[0]?.total ?? 0,
+      columns: cols.rows,
+      constraints: constraints.rows,
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
