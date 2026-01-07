@@ -1360,6 +1360,31 @@ app.get("/debug/stock-schema", async (req, res) => {
   }
 });
 
+// DEBUG: check AFAS connector output (no DB writes)
+app.get("/debug/afas/categories", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const connectorId = req.query.connectorId || "Items_Category_app";
+  const take = Math.min(200, Math.max(1, Number(req.query.take || 25)));
+  const skip = Math.max(0, Number(req.query.skip || 0));
+
+  try {
+    const data = await fetchAfasWithRetry(connectorId, { skip, take });
+    res.json({
+      ok: true,
+      connectorId,
+      skip,
+      take,
+      rowCount: (data?.rows ?? []).length,
+      rows: data?.rows ?? [],
+    });
+  } catch (err) {
+    console.error("GET /debug/afas/categories:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+
 /* =========================================================
    Error handler
    ========================================================= */
