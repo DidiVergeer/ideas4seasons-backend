@@ -1131,18 +1131,21 @@ async function getImagesForItemcode(itemcode) {
       (SELECT cdn_url FROM product_pictures WHERE itemcode=$1 AND kind='SFEER_5' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_5
   `;
   const { rows } = await pool.query(q, [String(itemcode)]);
-  return rows[0] || {
-    image_url: "",
-    image_urls: [],
-    sfeer_1: null,
-    sfeer_2: null,
-    sfeer_3: null,
-    sfeer_4: null,
-    sfeer_5: null,
-  };
+  return (
+    rows[0] || {
+      image_url: "",
+      image_urls: [],
+      sfeer_1: null,
+      sfeer_2: null,
+      sfeer_3: null,
+      sfeer_4: null,
+      sfeer_5: null,
+    }
+  );
 }
 
 // ✅ UPDATED: products list now includes image_urls + sfeer_1..5
+// ✅ STOCK ADDITION: LEFT JOIN product_stock + select economic_stock/on_order/arrival_date
 app.get("/products", async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
   const offset = Math.max(0, Number(req.query.offset || 0));
@@ -1159,6 +1162,11 @@ app.get("/products", async (req, res) => {
         p.innercarton,
         p.unit,
 
+        -- ✅ STOCK (added, non-breaking)
+        ps.economic_stock,
+        ps.on_order,
+        ps.arrival_date,
+
         -- MAIN image url (first)
         COALESCE((
           SELECT pp.cdn_url
@@ -1170,7 +1178,7 @@ app.get("/products", async (req, res) => {
           LIMIT 1
         ), '') AS image_url,
 
-        -- ✅ NEW: MAIN + SFEER_1..5 in order
+        -- MAIN + SFEER_1..5 in order
         COALESCE((
           SELECT array_remove(array_agg(pp2.cdn_url ORDER BY
             CASE
@@ -1199,6 +1207,8 @@ app.get("/products", async (req, res) => {
         (SELECT cdn_url FROM product_pictures WHERE itemcode=p.itemcode AND kind='SFEER_5' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_5
 
       FROM products p
+      LEFT JOIN product_stock ps
+        ON ps.itemcode = p.itemcode
       WHERE p.ecommerce_available = true
       ORDER BY p.itemcode
       LIMIT $1 OFFSET $2
@@ -1212,6 +1222,7 @@ app.get("/products", async (req, res) => {
 });
 
 // ✅ NEW: product detail endpoint (fixes your 404)
+// ✅ STOCK ADDITION: LEFT JOIN product_stock + include economic_stock/on_order/arrival_date
 app.get("/products/:itemcode", async (req, res) => {
   const itemcode = String(req.params.itemcode || "").trim();
   if (!itemcode) return res.status(400).json({ ok: false, error: "Missing itemcode" });
@@ -1227,8 +1238,16 @@ app.get("/products/:itemcode", async (req, res) => {
         p.available_stock,
         p.outercarton,
         p.innercarton,
-        p.unit
+        p.unit,
+
+        -- ✅ STOCK (added, non-breaking)
+        ps.economic_stock,
+        ps.on_order,
+        ps.arrival_date
+
       FROM products p
+      LEFT JOIN product_stock ps
+        ON ps.itemcode = p.itemcode
       WHERE p.itemcode = $1
         AND p.ecommerce_available = true
       LIMIT 1
