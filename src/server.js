@@ -368,22 +368,52 @@ app.post("/db/setup-products", async (req, res) => {
         innercarton TEXT NULL,
         unit TEXT NULL,
 
+        -- ✅ NEW: categories + extra item info (non-breaking)
+        type_item TEXT NULL,
+        category_1 TEXT NULL,
+        category_2 TEXT NULL,
+        category_3 TEXT NULL,
+        category_4 TEXT NULL,
+        category_5 TEXT NULL,
+        pallet TEXT NULL,
+        price_group TEXT NULL,
+        vat_tariff_group TEXT NULL,
+        category_raw JSONB NULL,
+
         raw JSONB NULL,
         updated_at TIMESTAMP DEFAULT NOW()
       );
     `);
 
+    // keep existing alter, extend with new columns (safe)
     await pool.query(`
       ALTER TABLE products
         ADD COLUMN IF NOT EXISTS outercarton TEXT NULL,
         ADD COLUMN IF NOT EXISTS innercarton TEXT NULL,
-        ADD COLUMN IF NOT EXISTS unit TEXT NULL;
+        ADD COLUMN IF NOT EXISTS unit TEXT NULL,
+
+        -- ✅ NEW: categories + extra item info
+        ADD COLUMN IF NOT EXISTS type_item TEXT NULL,
+        ADD COLUMN IF NOT EXISTS category_1 TEXT NULL,
+        ADD COLUMN IF NOT EXISTS category_2 TEXT NULL,
+        ADD COLUMN IF NOT EXISTS category_3 TEXT NULL,
+        ADD COLUMN IF NOT EXISTS category_4 TEXT NULL,
+        ADD COLUMN IF NOT EXISTS category_5 TEXT NULL,
+        ADD COLUMN IF NOT EXISTS pallet TEXT NULL,
+        ADD COLUMN IF NOT EXISTS price_group TEXT NULL,
+        ADD COLUMN IF NOT EXISTS vat_tariff_group TEXT NULL,
+        ADD COLUMN IF NOT EXISTS category_raw JSONB NULL;
     `);
 
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_ean ON products(ean);`);
     await pool.query(
       `CREATE INDEX IF NOT EXISTS idx_products_ecom ON products(ecommerce_available) WHERE ecommerce_available = true;`
     );
+
+    // helpful for filtering later
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_cat1 ON products(category_1);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_cat2 ON products(category_2);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_cat3 ON products(category_3);`);
 
     res.json({ ok: true, message: "products table ready" });
   } catch (err) {
@@ -613,6 +643,112 @@ app.post("/sync/products", async (req, res) => {
     res.json({ ok: true, connectorId, upserted });
   } catch (err) {
     console.error("sync/products:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+/* =========================================================
+   ✅ NEW: Sync categories + extra item info (Items_Category_app)
+   ========================================================= */
+app.post("/sync/categories", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const connectorId = req.query.connectorId || "Items_Category_app";
+  const take = Number(req.query.take || process.env.AFAS_TAKE_DEFAULT || 200);
+
+  let upserted = 0;
+  let skippedNoItemcode = 0;
+
+  try {
+    let skip = 0;
+    while (true) {
+      const data = await fetchAfasWithRetry(connectorId, { skip, take });
+      const rows = data?.rows || [];
+      if (!rows.length) break;
+
+      for (const r of rows) {
+        const itemcode = r.Itemcode ?? r.itemcode ?? r.Code ?? r.code ?? null;
+        if (!itemcode) {
+          skippedNoItemcode += 1;
+          continue;
+        }
+
+        // AFAS field names as you showed in screenshots
+        const type_item = r.Type_item ?? r.Type ?? r.type_item ?? null;
+
+        const ecommerce_available = parseBool(r["E-commerce_beschikbaar"] ?? r.Ecommerce ?? r.ecommerce_available);
+
+        const category_1 = r.Webshop_Categorie ?? r.WebshopCategorie ?? r.category_1 ?? null;
+        const category_2 = r.Webshop_Categorie_2 ?? r.WebshopCategorie_2 ?? r.category_2 ?? null;
+        const category_3 = r.Webshop_Categorie_3 ?? r.WebshopCategorie_3 ?? r.category_3 ?? null;
+        const category_4 = r.Webshop_Categorie_4 ?? r.WebshopCategorie_4 ?? r.category_4 ?? null;
+        const category_5 = r.Webshop_Categorie_5 ?? r.WebshopCategorie_5 ?? r.category_5 ?? null;
+
+        const pallet = r.PALLET ?? r.pallet ?? null;
+
+        // In jouw connector heet "Omschrijving" dus de prijsgroep (soms "50%" etc.)
+        const price_group = r.Omschrijving ?? r.omschrijving ?? r.Prijsgroep ?? r.price_group ?? null;
+
+        const vat_tariff_group = r.Btw_tariefgroep ?? r["Btw-tariefgroep"] ?? r.vat_tariff_group ?? null;
+
+        await pool.query(
+          `
+          INSERT INTO products (
+            itemcode,
+            ecommerce_available,
+            type_item,
+            category_1, category_2, category_3, category_4, category_5,
+            pallet,
+            price_group,
+            vat_tariff_group,
+            category_raw,
+            updated_at
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+          ON CONFLICT (itemcode) DO UPDATE SET
+            -- only overwrite if provided (keep existing data safe)
+            ecommerce_available = COALESCE(EXCLUDED.ecommerce_available, products.ecommerce_available),
+            type_item = COALESCE(EXCLUDED.type_item, products.type_item),
+
+            category_1 = COALESCE(EXCLUDED.category_1, products.category_1),
+            category_2 = COALESCE(EXCLUDED.category_2, products.category_2),
+            category_3 = COALESCE(EXCLUDED.category_3, products.category_3),
+            category_4 = COALESCE(EXCLUDED.category_4, products.category_4),
+            category_5 = COALESCE(EXCLUDED.category_5, products.category_5),
+
+            pallet = COALESCE(EXCLUDED.pallet, products.pallet),
+            price_group = COALESCE(EXCLUDED.price_group, products.price_group),
+            vat_tariff_group = COALESCE(EXCLUDED.vat_tariff_group, products.vat_tariff_group),
+
+            category_raw = EXCLUDED.category_raw,
+            updated_at = NOW()
+          `,
+          [
+            String(itemcode),
+            ecommerce_available,
+            type_item ? String(type_item) : null,
+            category_1 ? String(category_1) : null,
+            category_2 ? String(category_2) : null,
+            category_3 ? String(category_3) : null,
+            category_4 ? String(category_4) : null,
+            category_5 ? String(category_5) : null,
+            pallet ? String(pallet) : null,
+            price_group ? String(price_group) : null,
+            vat_tariff_group ? String(vat_tariff_group) : null,
+            r,
+          ]
+        );
+
+        upserted += 1;
+      }
+
+      skip += rows.length;
+      if (rows.length < take) break;
+    }
+
+    res.json({ ok: true, connectorId, upserted, skippedNoItemcode });
+  } catch (err) {
+    console.error("sync/categories:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
@@ -1146,6 +1282,7 @@ async function getImagesForItemcode(itemcode) {
 
 // ✅ UPDATED: products list now includes image_urls + sfeer_1..5
 // ✅ STOCK ADDITION: LEFT JOIN product_stock + select economic_stock/on_order/arrival_date
+// ✅ NEW: categories + extra fields are included
 app.get("/products", async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
   const offset = Math.max(0, Number(req.query.offset || 0));
@@ -1161,6 +1298,17 @@ app.get("/products", async (req, res) => {
         p.outercarton,
         p.innercarton,
         p.unit,
+
+        -- ✅ NEW: categories + extra item info
+        p.type_item,
+        p.category_1,
+        p.category_2,
+        p.category_3,
+        p.category_4,
+        p.category_5,
+        p.pallet,
+        p.price_group,
+        p.vat_tariff_group,
 
         -- ✅ STOCK (added, non-breaking)
         ps.economic_stock,
@@ -1223,6 +1371,7 @@ app.get("/products", async (req, res) => {
 
 // ✅ NEW: product detail endpoint (fixes your 404)
 // ✅ STOCK ADDITION: LEFT JOIN product_stock + include economic_stock/on_order/arrival_date
+// ✅ NEW: categories + extra fields are included
 app.get("/products/:itemcode", async (req, res) => {
   const itemcode = String(req.params.itemcode || "").trim();
   if (!itemcode) return res.status(400).json({ ok: false, error: "Missing itemcode" });
@@ -1239,6 +1388,17 @@ app.get("/products/:itemcode", async (req, res) => {
         p.outercarton,
         p.innercarton,
         p.unit,
+
+        -- ✅ NEW: categories + extra item info
+        p.type_item,
+        p.category_1,
+        p.category_2,
+        p.category_3,
+        p.category_4,
+        p.category_5,
+        p.pallet,
+        p.price_group,
+        p.vat_tariff_group,
 
         -- ✅ STOCK (added, non-breaking)
         ps.economic_stock,
@@ -1383,7 +1543,6 @@ app.get("/debug/afas/categories", async (req, res) => {
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
-
 
 /* =========================================================
    Error handler
