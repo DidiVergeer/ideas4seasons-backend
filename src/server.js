@@ -201,7 +201,6 @@ function toDateOrNull(v) {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
   if (!s) return null;
-  // Keep as ISO-like string; PG DATE accepts 'YYYY-MM-DD' and most ISO formats
   return s;
 }
 
@@ -280,10 +279,6 @@ async function fetchAfasWithRetry(connectorId, opts = {}, retry = {}) {
   throw lastErr || new Error("AFAS fetch failed");
 }
 
-/**
- * Items_Pictures_app per-item lookup. Filtering can be flaky.
- * We try Itemcode + Code, with/without operatortypes=1.
- */
 async function fetchAfasPicturesRowByItemcode(itemcode) {
   const connectorId = "Items_Pictures_app";
   const encoded = encodeURIComponent(String(itemcode));
@@ -425,7 +420,7 @@ app.post("/db/setup-afas-extra", async (req, res) => {
       ON product_pictures (itemcode, kind, sort_order, picture_id);
     `);
 
-    // stock (non-destructive basic creation; rebuild endpoint below is the safe "drop & create")
+    // stock
     await pool.query(`
       CREATE TABLE IF NOT EXISTS product_stock (
         itemcode TEXT PRIMARY KEY,
@@ -463,7 +458,6 @@ app.post("/db/setup-afas-extra", async (req, res) => {
 /* =========================================================
    NEW: SAFE stock rebuild (DROP + CREATE clean schema)
    ========================================================= */
-// GET /db/rebuild-stock?key=...
 app.get("/db/rebuild-stock", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
@@ -625,20 +619,6 @@ app.post("/sync/products", async (req, res) => {
 
 /* =========================================================
    Sync stock (Items_stock_app)
-   Only AFAS fields:
-   - Itemcode
-   - Beschik_vrrd
-   - In_bestelling
-   - Aankomst_datum
-   - Eco_vrrd
-   DB columns:
-   - itemcode (PK)
-   - available_stock
-   - economic_stock
-   - on_order
-   - arrival_date
-   - raw
-   - updated_at
    ========================================================= */
 app.post("/sync/stock", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
@@ -663,7 +643,6 @@ app.post("/sync/stock", async (req, res) => {
           continue;
         }
 
-        // Only the 5 AFAS fields + keep full raw row
         const available_stock = toNumberOrNull(r.Beschik_vrrd);
         const on_order = toNumberOrNull(r.In_bestelling);
         const arrival_date = toDateOrNull(r.Aankomst_datum);
@@ -1106,7 +1085,64 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
    API
    ========================================================= */
 
-// products list (kept as-is, stock can be added later)
+/**
+ * ✅ NEW helper query: images for an item
+ * returns:
+ * - image_url (main)
+ * - image_urls (MAIN + SFEER_1..5 ordered)
+ * - sfeer_1..5 convenience fields
+ */
+async function getImagesForItemcode(itemcode) {
+  const q = `
+    SELECT
+      -- MAIN
+      (SELECT cdn_url
+       FROM product_pictures
+       WHERE itemcode = $1 AND kind='MAIN' AND cdn_url IS NOT NULL
+       ORDER BY sort_order, picture_id
+       LIMIT 1) AS image_url,
+
+      -- Array in desired order: MAIN, SFEER_1..5
+      COALESCE((
+        SELECT array_remove(array_agg(pp.cdn_url ORDER BY
+          CASE
+            WHEN pp.kind='MAIN' THEN 0
+            WHEN pp.kind='SFEER_1' THEN 1
+            WHEN pp.kind='SFEER_2' THEN 2
+            WHEN pp.kind='SFEER_3' THEN 3
+            WHEN pp.kind='SFEER_4' THEN 4
+            WHEN pp.kind='SFEER_5' THEN 5
+            ELSE 999
+          END,
+          COALESCE(pp.sort_order, 999),
+          pp.picture_id
+        ), NULL)
+        FROM product_pictures pp
+        WHERE pp.itemcode = $1
+          AND pp.cdn_url IS NOT NULL
+          AND pp.kind IN ('MAIN','SFEER_1','SFEER_2','SFEER_3','SFEER_4','SFEER_5')
+      ), ARRAY[]::text[]) AS image_urls,
+
+      -- Convenience: sfeer slots
+      (SELECT cdn_url FROM product_pictures WHERE itemcode=$1 AND kind='SFEER_1' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_1,
+      (SELECT cdn_url FROM product_pictures WHERE itemcode=$1 AND kind='SFEER_2' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_2,
+      (SELECT cdn_url FROM product_pictures WHERE itemcode=$1 AND kind='SFEER_3' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_3,
+      (SELECT cdn_url FROM product_pictures WHERE itemcode=$1 AND kind='SFEER_4' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_4,
+      (SELECT cdn_url FROM product_pictures WHERE itemcode=$1 AND kind='SFEER_5' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_5
+  `;
+  const { rows } = await pool.query(q, [String(itemcode)]);
+  return rows[0] || {
+    image_url: "",
+    image_urls: [],
+    sfeer_1: null,
+    sfeer_2: null,
+    sfeer_3: null,
+    sfeer_4: null,
+    sfeer_5: null,
+  };
+}
+
+// ✅ UPDATED: products list now includes image_urls + sfeer_1..5
 app.get("/products", async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
   const offset = Math.max(0, Number(req.query.offset || 0));
@@ -1122,17 +1158,46 @@ app.get("/products", async (req, res) => {
         p.outercarton,
         p.innercarton,
         p.unit,
+
+        -- MAIN image url (first)
         COALESCE((
           SELECT pp.cdn_url
           FROM product_pictures pp
           WHERE pp.itemcode = p.itemcode
+            AND pp.kind='MAIN'
             AND pp.cdn_url IS NOT NULL
-          ORDER BY
-            CASE WHEN pp.kind='MAIN' THEN 0 ELSE 1 END,
-            COALESCE(pp.sort_order, 999),
-            pp.picture_id
+          ORDER BY COALESCE(pp.sort_order, 999), pp.picture_id
           LIMIT 1
-        ), '') AS image_url
+        ), '') AS image_url,
+
+        -- ✅ NEW: MAIN + SFEER_1..5 in order
+        COALESCE((
+          SELECT array_remove(array_agg(pp2.cdn_url ORDER BY
+            CASE
+              WHEN pp2.kind='MAIN' THEN 0
+              WHEN pp2.kind='SFEER_1' THEN 1
+              WHEN pp2.kind='SFEER_2' THEN 2
+              WHEN pp2.kind='SFEER_3' THEN 3
+              WHEN pp2.kind='SFEER_4' THEN 4
+              WHEN pp2.kind='SFEER_5' THEN 5
+              ELSE 999
+            END,
+            COALESCE(pp2.sort_order, 999),
+            pp2.picture_id
+          ), NULL)
+          FROM product_pictures pp2
+          WHERE pp2.itemcode = p.itemcode
+            AND pp2.cdn_url IS NOT NULL
+            AND pp2.kind IN ('MAIN','SFEER_1','SFEER_2','SFEER_3','SFEER_4','SFEER_5')
+        ), ARRAY[]::text[]) AS image_urls,
+
+        -- convenience sfeer fields (optional)
+        (SELECT cdn_url FROM product_pictures WHERE itemcode=p.itemcode AND kind='SFEER_1' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_1,
+        (SELECT cdn_url FROM product_pictures WHERE itemcode=p.itemcode AND kind='SFEER_2' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_2,
+        (SELECT cdn_url FROM product_pictures WHERE itemcode=p.itemcode AND kind='SFEER_3' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_3,
+        (SELECT cdn_url FROM product_pictures WHERE itemcode=p.itemcode AND kind='SFEER_4' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_4,
+        (SELECT cdn_url FROM product_pictures WHERE itemcode=p.itemcode AND kind='SFEER_5' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_5
+
       FROM products p
       WHERE p.ecommerce_available = true
       ORDER BY p.itemcode
@@ -1142,6 +1207,55 @@ app.get("/products", async (req, res) => {
     res.json({ ok: true, limit, offset, count: rows.length, data: rows });
   } catch (err) {
     console.error("GET /products:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+// ✅ NEW: product detail endpoint (fixes your 404)
+app.get("/products/:itemcode", async (req, res) => {
+  const itemcode = String(req.params.itemcode || "").trim();
+  if (!itemcode) return res.status(400).json({ ok: false, error: "Missing itemcode" });
+
+  try {
+    const pr = await pool.query(
+      `
+      SELECT
+        p.itemcode,
+        p.description_eng,
+        p.ean,
+        p.price,
+        p.available_stock,
+        p.outercarton,
+        p.innercarton,
+        p.unit
+      FROM products p
+      WHERE p.itemcode = $1
+        AND p.ecommerce_available = true
+      LIMIT 1
+      `,
+      [itemcode]
+    );
+
+    const base = pr.rows[0];
+    if (!base) return res.status(404).json({ ok: false, error: "Not found" });
+
+    const imgs = await getImagesForItemcode(itemcode);
+
+    res.json({
+      ok: true,
+      data: {
+        ...base,
+        image_url: imgs.image_url || base.image_url || "",
+        image_urls: imgs.image_urls || [],
+        sfeer_1: imgs.sfeer_1,
+        sfeer_2: imgs.sfeer_2,
+        sfeer_3: imgs.sfeer_3,
+        sfeer_4: imgs.sfeer_4,
+        sfeer_5: imgs.sfeer_5,
+      },
+    });
+  } catch (err) {
+    console.error("GET /products/:itemcode:", err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
@@ -1178,7 +1292,6 @@ app.get("/debug/pictures/sfeer-counts", async (req, res) => {
   }
 });
 
-// GET /debug/stock-schema?key=...
 app.get("/debug/stock-schema", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
