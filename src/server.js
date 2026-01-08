@@ -1265,7 +1265,7 @@ app.get("/customers/core", async (req, res) => {
 
 // ✅ NEW: Debiteur addresses API (no DB writes)
 app.get("/customers/addresses", async (req, res) => {
-  const take = Math.min(200, Math.max(1, Number(req.query.take || 50)));
+  const take = Math.min(200, Math.max(1, Number(req.query.take || 200)));
   const skip = Math.max(0, Number(req.query.skip || 0));
 
   try {
