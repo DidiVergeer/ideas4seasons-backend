@@ -204,6 +204,28 @@ function toDateOrNull(v) {
   return s;
 }
 
+function digitsOnly(v) {
+  return String(v ?? "").trim().replace(/[^\d]/g, "");
+}
+
+function buildEanCandidates(code) {
+  const c = digitsOnly(code);
+  if (!c) return [];
+  const set = new Set([c]);
+
+  // UPC-A 12 → EAN-13 vaak 0 + code
+  if (c.length === 12) set.add("0" + c);
+
+  // 13 → soms opgeslagen als 14 met leading 0
+  if (c.length === 13) set.add("0" + c);
+
+  // 14 met leading 0 → probeer ook 13 zonder 0
+  if (c.length === 14 && c.startsWith("0")) set.add(c.slice(1));
+
+  return Array.from(set);
+}
+
+
 /* =========================================================
    Field mapping (must exist before SFEER code uses it)
    ========================================================= */
@@ -1221,6 +1243,101 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
    API
    ========================================================= */
 
+// ✅ NEW: fast lookup by EAN (scanner)
+// Returns the same "shape" as other endpoints: { ok: true, data: row|null }
+app.get("/products/by-ean/:ean", async (req, res) => {
+  const raw = req.params.ean;
+  const code = digitsOnly(raw);
+
+  // allow 8-14 digits (EAN8/EAN13/UPC etc.), but scanner mainly uses 12/13
+  if (!code || !/^\d{8,14}$/.test(code)) {
+    return res.status(400).json({ ok: false, error: "Invalid EAN" });
+  }
+
+  try {
+    const candidates = buildEanCandidates(code);
+
+    const q = `
+      SELECT
+        p.itemcode,
+        p.description_eng,
+        p.ean,
+        p.price,
+        p.available_stock,
+        p.outercarton,
+        p.innercarton,
+        p.unit,
+
+        -- categories + extra item info
+        p.type_item,
+        p.category_1,
+        p.category_2,
+        p.category_3,
+        p.category_4,
+        p.category_5,
+        p.pallet,
+        p.price_group,
+        p.vat_tariff_group,
+
+        -- stock
+        ps.economic_stock,
+        ps.on_order,
+        ps.arrival_date,
+
+        -- MAIN image url (first)
+        COALESCE((
+          SELECT pp.cdn_url
+          FROM product_pictures pp
+          WHERE pp.itemcode = p.itemcode
+            AND pp.kind='MAIN'
+            AND pp.cdn_url IS NOT NULL
+          ORDER BY COALESCE(pp.sort_order, 999), pp.picture_id
+          LIMIT 1
+        ), '') AS image_url,
+
+        -- MAIN + SFEER_1..5 in order
+        COALESCE((
+          SELECT array_remove(array_agg(pp2.cdn_url ORDER BY
+            CASE
+              WHEN pp2.kind='MAIN' THEN 0
+              WHEN pp2.kind='SFEER_1' THEN 1
+              WHEN pp2.kind='SFEER_2' THEN 2
+              WHEN pp2.kind='SFEER_3' THEN 3
+              WHEN pp2.kind='SFEER_4' THEN 4
+              WHEN pp2.kind='SFEER_5' THEN 5
+              ELSE 999
+            END,
+            COALESCE(pp2.sort_order, 999),
+            pp2.picture_id
+          ), NULL)
+          FROM product_pictures pp2
+          WHERE pp2.itemcode = p.itemcode
+            AND pp2.cdn_url IS NOT NULL
+            AND pp2.kind IN ('MAIN','SFEER_1','SFEER_2','SFEER_3','SFEER_4','SFEER_5')
+        ), ARRAY[]::text[]) AS image_urls,
+
+        -- convenience sfeer fields
+        (SELECT cdn_url FROM product_pictures WHERE itemcode=p.itemcode AND kind='SFEER_1' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_1,
+        (SELECT cdn_url FROM product_pictures WHERE itemcode=p.itemcode AND kind='SFEER_2' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_2,
+        (SELECT cdn_url FROM product_pictures WHERE itemcode=p.itemcode AND kind='SFEER_3' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_3,
+        (SELECT cdn_url FROM product_pictures WHERE itemcode=p.itemcode AND kind='SFEER_4' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_4,
+        (SELECT cdn_url FROM product_pictures WHERE itemcode=p.itemcode AND kind='SFEER_5' AND cdn_url IS NOT NULL ORDER BY sort_order, picture_id LIMIT 1) AS sfeer_5
+
+      FROM products p
+      LEFT JOIN product_stock ps ON ps.itemcode = p.itemcode
+      WHERE p.ecommerce_available = true
+        AND p.ean = ANY($1)
+      LIMIT 1
+    `;
+
+    const { rows } = await pool.query(q, [candidates]);
+    return res.json({ ok: true, data: rows[0] ?? null });
+  } catch (err) {
+    console.error("GET /products/by-ean/:ean:", err);
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 /**
  * ✅ NEW helper query: images for an item
  * returns:
@@ -1438,6 +1555,8 @@ app.get("/products/:itemcode", async (req, res) => {
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
+
+
 
 /* =========================================================
    Debug
