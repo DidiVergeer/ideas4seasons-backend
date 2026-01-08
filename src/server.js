@@ -225,7 +225,6 @@ function buildEanCandidates(code) {
   return Array.from(set);
 }
 
-
 /* =========================================================
    Field mapping (must exist before SFEER code uses it)
    ========================================================= */
@@ -1243,6 +1242,73 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
    API
    ========================================================= */
 
+// ✅ NEW: Debiteur core API (no DB writes)
+app.get("/customers/core", async (req, res) => {
+  const take = Math.min(200, Math.max(1, Number(req.query.take || 50)));
+  const skip = Math.max(0, Number(req.query.skip || 0));
+
+  try {
+    const data = await fetchAfasWithRetry("Debiteur_core_app", { skip, take });
+    res.json({
+      ok: true,
+      connectorId: "Debiteur_core_app",
+      skip,
+      take,
+      rowCount: (data?.rows ?? []).length,
+      rows: data?.rows ?? [],
+    });
+  } catch (err) {
+    console.error("GET /customers/core:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+// ✅ NEW: Debiteur addresses API (no DB writes)
+app.get("/customers/addresses", async (req, res) => {
+  const take = Math.min(200, Math.max(1, Number(req.query.take || 50)));
+  const skip = Math.max(0, Number(req.query.skip || 0));
+
+  try {
+    const data = await fetchAfasWithRetry("Debiteur_addresses_app", { skip, take });
+    res.json({
+      ok: true,
+      connectorId: "Debiteur_addresses_app",
+      skip,
+      take,
+      rowCount: (data?.rows ?? []).length,
+      rows: data?.rows ?? [],
+    });
+  } catch (err) {
+    console.error("GET /customers/addresses:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+// ✅ NEW: Debiteur contacts API (minimal change, no DB writes)
+// Returns only the 3 fields you need for the app: contact_name, email, phone (+ debiteur_number to link)
+app.get("/customers/contacts", async (req, res) => {
+  const take = Math.min(200, Math.max(1, Number(req.query.take || 50)));
+  const skip = Math.max(0, Number(req.query.skip || 0));
+
+  try {
+    const data = await fetchAfasWithRetry("Debiteur_contacts_app", { skip, take });
+    const rows = data?.rows || [];
+
+    const mapped = rows.map((r) => ({
+      debiteur_number: r.Verkooprelatie ?? r.Nummer_debiteur ?? null,
+      debiteur_name: r.Naam_debiteur ?? null,
+      contact_name: r.Omschrijving ?? null,
+      email: r["E-mail_werk"] ?? r.E_mail_werk ?? null,
+      phone: r.Telefoon_werk ?? null,
+    }));
+
+    res.json({ ok: true, connectorId: "Debiteur_contacts_app", skip, take, rowCount: mapped.length, rows: mapped });
+  } catch (err) {
+    console.error("GET /customers/contacts:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 // ✅ NEW: fast lookup by EAN (scanner)
 // Returns the same "shape" as other endpoints: { ok: true, data: row|null }
 app.get("/products/by-ean/:ean", async (req, res) => {
@@ -1555,8 +1621,6 @@ app.get("/products/:itemcode", async (req, res) => {
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
-
-
 
 /* =========================================================
    Debug
