@@ -1516,7 +1516,14 @@ app.post("/prices/resolve", async (req, res) => {
       prijslijstSource = "body";
     } else {
       const debCore = await fetchDebiteurCoreRowByNumber(customerId);
-      const fromCore = extractPrijslijstCodeFromDebiteurCore(debCore);
+
+  // ✅ Optioneel: force/prijslijst override via body (handig voor debug/testen)
+  const bodyPrijslijst = normCode(req.body?.prijslijstCode);
+
+  const prijslijstCode =
+  bodyPrijslijst ||
+   extractPrijslijstCodeFromDebiteurCore(debCore) ||
+    "";
       if (fromCore) {
         prijslijstCode = fromCore;
         prijslijstSource = "debiteur_core";
