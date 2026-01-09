@@ -1242,6 +1242,291 @@ app.post("/sync/upload-pictures-to-r2", async (req, res) => {
    API
    ========================================================= */
 
+/* =========================================================
+   PRICES (NEW)
+   - debiteur override > prijslijst > basis (products.price)
+   - Verkoopprijs = bedrag
+   - Huidige_prijs = boolean (alleen huidige regels)
+   - Geblokkeerd = boolean (negeren als true)
+   ========================================================= */
+
+async function fetchAfasAll(connectorId, { extraQuery = "", take = 500 } = {}) {
+  const rowsAll = [];
+  let skip = 0;
+
+  const safeTake = Math.min(1750, Math.max(1, Number(take) || 500));
+
+  while (true) {
+    const data = await fetchAfasWithRetry(connectorId, { skip, take: safeTake, extraQuery });
+    const rows = data?.rows || [];
+    if (!rows.length) break;
+
+    rowsAll.push(...rows);
+
+    skip += rows.length;
+    if (rows.length < safeTake) break;
+  }
+
+  return rowsAll;
+}
+
+function pickField(obj, keys) {
+  for (const k of keys) {
+    if (obj && obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") return obj[k];
+  }
+  return null;
+}
+
+function normCode(v) {
+  return String(v ?? "").trim();
+}
+
+function rowItemcode(r) {
+  return normCode(pickField(r, ["Itemcode", "itemcode", "Code", "code"]));
+}
+
+function rowDebiteur(r) {
+  return normCode(pickField(r, ["Debiteur_nummer", "Debiteur", "debiteur_nummer", "debiteur"]));
+}
+
+function rowPrijslijst(r) {
+  return normCode(pickField(r, ["Prijslijst", "Prs_lst", "Prijslijst_code", "prijslijst", "prijslijst_code"]));
+}
+
+function rowIsCurrent(r) {
+  return parseBool(pickField(r, ["Huidige_prijs", "Huidige prijs", "huidige_prijs", "Huidige"]));
+}
+
+function rowIsBlocked(r) {
+  return parseBool(pickField(r, ["Geblokkeerd", "Gbl", "geblokkeerd"]));
+}
+
+function rowPriceAmount(r) {
+  return toNumberOrNull(pickField(r, ["Verkoopprijs", "Vrk_prijs", "Vrk.prijs", "vrk_prijs", "price"]));
+}
+
+async function fetchDebiteurCoreRowByNumber(debiteurNummer) {
+  const encoded = encodeURIComponent(String(debiteurNummer));
+
+  // We proberen meerdere mogelijke veldnamen; AFAS verschilt per inrichting.
+  const tries = [
+    `&filterfieldids=Nummer_debiteur&filtervalues=${encoded}`,
+    `&filterfieldids=Debiteur_nummer&filtervalues=${encoded}`,
+    `&filterfieldids=Debiteur&filtervalues=${encoded}`,
+    `&filterfieldids=Nummer_debiteur&filtervalues=${encoded}&operatortypes=1`,
+    `&filterfieldids=Debiteur_nummer&filtervalues=${encoded}&operatortypes=1`,
+    `&filterfieldids=Debiteur&filtervalues=${encoded}&operatortypes=1`,
+  ];
+
+  for (const extraQuery of tries) {
+    try {
+      const data = await fetchAfasWithRetry("Debiteur_core_app", { skip: 0, take: 1, extraQuery });
+      const row = data?.rows?.[0] || null;
+      if (row) return row;
+    } catch {}
+  }
+
+  return null;
+}
+
+function extractPrijslijstCodeFromDebiteurCore(row) {
+  // Pas deze lijst gerust aan aan jullie exacte veldnaam.
+  return normCode(
+    pickField(row, [
+      "Prijslijst_code",
+      "Prijslijst",
+      "Prijslijstcode",
+      "Prs_lst",
+      "PrijsLijst",
+      "prijslijst_code",
+    ])
+  );
+}
+
+/**
+ * GET /prices/debiteur?debiteur=400134&itemcode=10201
+ * Debug endpoint: laat de (huidige) debiteur prijsregel(s) zien.
+ */
+app.get("/prices/debiteur", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const debiteur = normCode(req.query.debiteur);
+  const itemcode = normCode(req.query.itemcode);
+  const take = Math.min(1750, Math.max(1, Number(req.query.take || 500)));
+
+  if (!debiteur) return res.status(400).json({ ok: false, error: "Missing debiteur" });
+
+  try {
+    const encodedDeb = encodeURIComponent(debiteur);
+
+    // Filter op debiteur (zodat we niet alles hoeven te laden)
+    const extraQuery = `&filterfieldids=Debiteur&filtervalues=${encodedDeb}`;
+
+    const rowsAll = await fetchAfasAll("prijs_debiteur_niveau_app", { extraQuery, take });
+
+    let rows = rowsAll.filter((r) => rowDebiteur(r) === debiteur);
+
+    // alleen huidige regels (default)
+    if (!parseBool(req.query.includeAll)) {
+      rows = rows.filter((r) => rowIsCurrent(r));
+    }
+
+    // optional filter op itemcode
+    if (itemcode) {
+      rows = rows.filter((r) => rowItemcode(r) === itemcode);
+    }
+
+    res.json({
+      ok: true,
+      connectorId: "prijs_debiteur_niveau_app",
+      debiteur,
+      itemcode: itemcode || null,
+      rowCount: rows.length,
+      rows,
+    });
+  } catch (err) {
+    console.error("GET /prices/debiteur:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+/**
+ * GET /prices/prijslijst?prijslijst=GFR22&itemcode=10201
+ * Debug endpoint: laat de (huidige, niet-gebokkeerde) prijslijst prijsregel(s) zien.
+ */
+app.get("/prices/prijslijst", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const prijslijst = normCode(req.query.prijslijst);
+  const itemcode = normCode(req.query.itemcode);
+  const take = Math.min(1750, Math.max(1, Number(req.query.take || 500)));
+
+  if (!prijslijst) return res.status(400).json({ ok: false, error: "Missing prijslijst" });
+
+  try {
+    const encodedPl = encodeURIComponent(prijslijst);
+
+    // Filter op prijslijst
+    const extraQuery = `&filterfieldids=Prijslijst&filtervalues=${encodedPl}`;
+
+    const rowsAll = await fetchAfasAll("prijslijst_app", { extraQuery, take });
+
+    let rows = rowsAll.filter((r) => rowPrijslijst(r) === prijslijst);
+
+    // default: alleen huidige + niet geblokkeerd
+    if (!parseBool(req.query.includeAll)) {
+      rows = rows.filter((r) => rowIsCurrent(r) && !rowIsBlocked(r));
+    }
+
+    if (itemcode) {
+      rows = rows.filter((r) => rowItemcode(r) === itemcode);
+    }
+
+    res.json({
+      ok: true,
+      connectorId: "prijslijst_app",
+      prijslijst,
+      itemcode: itemcode || null,
+      rowCount: rows.length,
+      rows,
+    });
+  } catch (err) {
+    console.error("GET /prices/prijslijst:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+/**
+ * POST /prices/resolve
+ * Body: { customerId: "400134", itemcodes: ["10201","..."] }
+ * Returns: { prices: { "10201": { price, source } ... } }
+ */
+app.post("/prices/resolve", async (req, res) => {
+  if (!requireSetupKey(req, res)) return;
+
+  const customerId = normCode(req.body?.customerId);
+  const itemcodes = Array.isArray(req.body?.itemcodes) ? req.body.itemcodes.map(normCode).filter(Boolean) : [];
+
+  if (!customerId) return res.status(400).json({ ok: false, error: "Missing customerId" });
+  if (!itemcodes.length) return res.status(400).json({ ok: false, error: "Missing itemcodes[]" });
+
+  try {
+    // 1) Debiteur core: haal prijslijstcode op
+    const debCore = await fetchDebiteurCoreRowByNumber(customerId);
+    const prijslijstCode = extractPrijslijstCodeFromDebiteurCore(debCore) || "";
+
+    // 2) Debiteur override regels (alle items voor die debiteur)
+    const encodedDeb = encodeURIComponent(customerId);
+    const debExtraQuery = `&filterfieldids=Debiteur&filtervalues=${encodedDeb}`;
+    const debRowsAll = await fetchAfasAll("prijs_debiteur_niveau_app", { extraQuery: debExtraQuery, take: 1000 });
+
+    const debMap = new Map(); // itemcode -> price
+    for (const r of debRowsAll) {
+      if (rowDebiteur(r) !== customerId) continue;
+      if (!rowIsCurrent(r)) continue;
+      const ic = rowItemcode(r);
+      const p = rowPriceAmount(r);
+      if (!ic || p === null) continue;
+      // debiteur override wint: als meerdere, laatste overschrijft (huidig zou uniek moeten zijn)
+      debMap.set(ic, p);
+    }
+
+    // 3) Prijslijst regels (alle items voor die prijslijst)
+    const listMap = new Map(); // itemcode -> price
+    if (prijslijstCode) {
+      const encodedPl = encodeURIComponent(prijslijstCode);
+      const plExtraQuery = `&filterfieldids=Prijslijst&filtervalues=${encodedPl}`;
+      const plRowsAll = await fetchAfasAll("prijslijst_app", { extraQuery: plExtraQuery, take: 1000 });
+
+      for (const r of plRowsAll) {
+        if (rowPrijslijst(r) !== prijslijstCode) continue;
+        if (!rowIsCurrent(r)) continue;
+        if (rowIsBlocked(r)) continue;
+        const ic = rowItemcode(r);
+        const p = rowPriceAmount(r);
+        if (!ic || p === null) continue;
+        listMap.set(ic, p);
+      }
+    }
+
+    // 4) Basisprijzen uit DB (products.price) voor fallback
+    const { rows: baseRows } = await pool.query(
+      `SELECT itemcode, price FROM products WHERE itemcode = ANY($1)`,
+      [itemcodes]
+    );
+    const baseMap = new Map(baseRows.map((r) => [String(r.itemcode), toNumberOrNull(r.price)]));
+
+    // 5) Resolve per item
+    const prices = {};
+    for (const ic of itemcodes) {
+      if (debMap.has(ic)) {
+        prices[ic] = { price: debMap.get(ic), source: "debiteur" };
+        continue;
+      }
+      if (listMap.has(ic)) {
+        prices[ic] = { price: listMap.get(ic), source: "prijslijst" };
+        continue;
+      }
+      const bp = baseMap.get(ic);
+      if (bp !== null && bp !== undefined) {
+        prices[ic] = { price: bp, source: "basis" };
+        continue;
+      }
+      prices[ic] = { price: null, source: "none" };
+    }
+
+    res.json({
+      ok: true,
+      customerId,
+      prijslijstCode: prijslijstCode || null,
+      prices,
+    });
+  } catch (err) {
+    console.error("POST /prices/resolve:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 // ✅ NEW: Debiteur core API (no DB writes)
 app.get("/customers/core", async (req, res) => {
   const take = Math.min(1750, Math.max(1, Number(req.query.take || 50)));
