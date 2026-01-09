@@ -1330,24 +1330,18 @@ async function fetchDebiteurCoreRowByNumber(debiteurNummer) {
 }
 
 function extractPrijslijstCodeFromDebiteurCore(row) {
-  // ✅ AFAS veldnaam bij jullie: Voorkeur_prijslijst (zoals je screenshot)
-  // + extra varianten voor safety
+  // ✅ jullie AFAS veldnaam is (waarschijnlijk): Voorkeur_prijslijst
   return normCode(
     pickField(row, [
-      // jullie veld
       "Voorkeur_prijslijst",
+      "Voorkeur_prijslijstcode",
       "Voorkeur_prijslijst_code",
-      "VoorkeurPrijslijst",
-      "VoorkeurPrijslijstCode",
-
-      // algemene varianten
       "Prijslijst_code",
       "Prijslijst",
       "Prijslijstcode",
       "Prs_lst",
       "PrijsLijst",
       "prijslijst_code",
-      "prijslijst",
     ])
   );
 }
@@ -1495,48 +1489,36 @@ app.post("/prices/resolve", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
   const customerId = normCode(req.body?.customerId);
-
-  // ✅ OPTIONAL: frontend mag prijslijstCode forceren (handig als core lookup faalt of voor testen)
-  const bodyPrijslijstCode = normCode(req.body?.prijslijstCode);
-
   const itemcodes = Array.isArray(req.body?.itemcodes)
     ? req.body.itemcodes.map(normCode).filter(Boolean)
     : [];
+
+  // ✅ optional: force a specific list from client (PowerShell / app)
+  const bodyPrijslijstCode = normCode(req.body?.prijslijstCode);
 
   if (!customerId) return res.status(400).json({ ok: false, error: "Missing customerId" });
   if (!itemcodes.length) return res.status(400).json({ ok: false, error: "Missing itemcodes[]" });
 
   try {
-    // 1) Debiteur core: haal prijslijstcode op (of neem body override)
+    // 1) Prijslijstcode bepalen
     let prijslijstCode = "";
-    let prijslijstSource = "none";
+    let prijslijstSource = null;
 
     if (bodyPrijslijstCode) {
       prijslijstCode = bodyPrijslijstCode;
       prijslijstSource = "body";
     } else {
       const debCore = await fetchDebiteurCoreRowByNumber(customerId);
-
-  // ✅ Optioneel: force/prijslijst override via body (handig voor debug/testen)
-  const bodyPrijslijst = normCode(req.body?.prijslijstCode);
-
-  const prijslijstCode =
-  bodyPrijslijst ||
-   extractPrijslijstCodeFromDebiteurCore(debCore) ||
-    "";
-      if (fromCore) {
-        prijslijstCode = fromCore;
-        prijslijstSource = "debiteur_core";
-      }
+      prijslijstCode = extractPrijslijstCodeFromDebiteurCore(debCore) || "";
+      prijslijstSource = prijslijstCode ? "debiteur_core" : null;
     }
 
-    // 2) Debiteur override regels (alle items voor die debiteur)
+    // 2) Debiteur override regels
     const encodedDeb = encodeURIComponent(customerId);
-
-    // ✅ iets robuuster: meerdere filter-keys proberen
     const debFilterTries = [
       `&filterfieldids=Debiteur_nummer&filtervalues=${encodedDeb}`,
       `&filterfieldids=Debiteur&filtervalues=${encodedDeb}`,
+      `&filterfieldids=Nummer_debiteur&filtervalues=${encodedDeb}`,
       `&filterfieldids=Debiteur_nummer&filtervalues=${encodedDeb}&operatortypes=1`,
       `&filterfieldids=Debiteur&filtervalues=${encodedDeb}&operatortypes=1`,
     ];
@@ -1553,56 +1535,38 @@ app.post("/prices/resolve", async (req, res) => {
     for (const r of debRowsAll) {
       if (rowDebiteur(r) !== customerId) continue;
       if (!rowIsCurrent(r)) continue;
-
       const ic = rowItemcode(r);
       const p = rowPriceAmount(r);
       if (!ic || p === null) continue;
-
       debMap.set(ic, p);
     }
 
-    // 3) Prijslijst regels (alle items voor die prijslijst)
+    // 3) Prijslijst regels
     const listMap = new Map(); // itemcode -> price
     if (prijslijstCode) {
       const encodedPl = encodeURIComponent(prijslijstCode);
-
-      // ✅ ook hier meerdere filter keys proberen (AFAS connector kan anders heten)
-      const plFilterTries = [
-        `&filterfieldids=Prijslijst&filtervalues=${encodedPl}`,
-        `&filterfieldids=Prijslijst_code&filtervalues=${encodedPl}`,
-        `&filterfieldids=Prs_lst&filtervalues=${encodedPl}`,
-        `&filterfieldids=Prijslijst&filtervalues=${encodedPl}&operatortypes=1`,
-      ];
-
-      const { data: plData } = await tryFetchAfasWithFilters("prijslijst_app", {
-        take: 1000,
-        skip: 0,
-        filterTries: plFilterTries,
-      });
-
-      const plRowsAll = plData?.rows || [];
+      const plExtraQuery = `&filterfieldids=Prijslijst&filtervalues=${encodedPl}`;
+      const plRowsAll = await fetchAfasAll("prijslijst_app", { extraQuery: plExtraQuery, take: 1000 });
 
       for (const r of plRowsAll) {
         if (rowPrijslijst(r) !== prijslijstCode) continue;
         if (!rowIsCurrent(r)) continue;
         if (rowIsBlocked(r)) continue;
-
         const ic = rowItemcode(r);
         const p = rowPriceAmount(r);
         if (!ic || p === null) continue;
-
         listMap.set(ic, p);
       }
     }
 
-    // 4) Basisprijzen uit DB (products.price) voor fallback
+    // 4) Basisprijzen uit DB (fallback)
     const { rows: baseRows } = await pool.query(
       `SELECT itemcode, price FROM products WHERE itemcode = ANY($1)`,
       [itemcodes]
     );
     const baseMap = new Map(baseRows.map((r) => [String(r.itemcode), toNumberOrNull(r.price)]));
 
-    // 5) Resolve per item
+    // 5) Resolve
     const prices = {};
     for (const ic of itemcodes) {
       if (debMap.has(ic)) {
