@@ -1350,8 +1350,8 @@ function extractPrijslijstCodeFromDebiteurCore(row) {
 app.get("/prices/debiteur", async (req, res) => {
   if (!requireSetupKey(req, res)) return;
 
-  const debiteur = normCode(req.query.debiteur);
-  const itemcode = normCode(req.query.itemcode);
+  const debiteur = String(req.query.debiteur || "").trim();
+  const itemcode = String(req.query.itemcode || "").trim();
   const take = Math.min(1750, Math.max(1, Number(req.query.take || 500)));
 
   if (!debiteur) return res.status(400).json({ ok: false, error: "Missing debiteur" });
@@ -1359,21 +1359,33 @@ app.get("/prices/debiteur", async (req, res) => {
   try {
     const encodedDeb = encodeURIComponent(debiteur);
 
-    // Filter op debiteur (zodat we niet alles hoeven te laden)
-    const extraQuery = `&filterfieldids=Debiteur&filtervalues=${encodedDeb}`;
+    // Probeer meerdere veldnamen (AFAS connectoren verschillen)
+    const filterTries = [
+      `&filterfieldids=Debiteur&filtervalues=${encodedDeb}`,
+      `&filterfieldids=Debiteur_nummer&filtervalues=${encodedDeb}`,
+      `&filterfieldids=Deb.&filtervalues=${encodedDeb}`,
+      `&filterfieldids=Debiteur&filtervalues=${encodedDeb}&operatortypes=1`,
+      `&filterfieldids=Debiteur_nummer&filtervalues=${encodedDeb}&operatortypes=1`,
+    ];
 
-    const rowsAll = await fetchAfasAll("prijs_debiteur_niveau_app", { extraQuery, take });
+    const { data, usedExtraQuery } = await tryFetchAfasWithFilters("prijs_debiteur_niveau_app", {
+      take,
+      skip: 0,
+      filterTries,
+    });
 
-    let rows = rowsAll.filter((r) => rowDebiteur(r) === debiteur);
+    let rows = data?.rows || [];
 
-    // alleen huidige regels (default)
-    if (!parseBool(req.query.includeAll)) {
-      rows = rows.filter((r) => rowIsCurrent(r));
+    // altijd nog lokaal filteren (ook bij fallback)
+    rows = rows.filter((r) => String(r.Debiteur_nummer ?? r.Debiteur ?? "").trim() === debiteur);
+
+    // default: alleen huidige regels
+    if (String(req.query.includeAll || "").toLowerCase() !== "true") {
+      rows = rows.filter((r) => parseBool(r.Huidige_prijs));
     }
 
-    // optional filter op itemcode
     if (itemcode) {
-      rows = rows.filter((r) => rowItemcode(r) === itemcode);
+      rows = rows.filter((r) => String(r.Itemcode ?? r.Code ?? "").trim() === itemcode);
     }
 
     res.json({
@@ -1381,14 +1393,43 @@ app.get("/prices/debiteur", async (req, res) => {
       connectorId: "prijs_debiteur_niveau_app",
       debiteur,
       itemcode: itemcode || null,
+      usedExtraQuery,
       rowCount: rows.length,
       rows,
     });
   } catch (err) {
     console.error("GET /prices/debiteur:", err);
-    res.status(500).json({ ok: false, error: err.message || String(err) });
+    res.status(500).json({
+      ok: false,
+      error: err.message || String(err),
+      afasStatus: err.status || null,
+      afasUrl: err.url || null,
+      afasBody: err.body || null,
+    });
   }
 });
+
+
+async function tryFetchAfasWithFilters(connectorId, { take = 500, skip = 0, filterTries = [] } = {}) {
+  let lastErr = null;
+
+  for (const extraQuery of filterTries) {
+    try {
+      const data = await fetchAfasWithRetry(connectorId, { skip, take, extraQuery });
+      return { data, usedExtraQuery: extraQuery };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  // fallback: no filter
+  try {
+    const data = await fetchAfasWithRetry(connectorId, { skip, take });
+    return { data, usedExtraQuery: "" };
+  } catch (e) {
+    throw lastErr || e;
+  }
+}
 
 /**
  * GET /prices/prijslijst?prijslijst=GFR22&itemcode=10201
