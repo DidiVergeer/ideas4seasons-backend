@@ -1496,6 +1496,13 @@ app.post("/prices/resolve", async (req, res) => {
   // ✅ optional: force a specific list from client (PowerShell / app)
   const bodyPrijslijstCode = normCode(req.body?.prijslijstCode);
 
+  console.log("RESOLVE IN:", {
+  customerId,
+  itemcodes,
+  bodyPrijslijstCode,
+});
+
+
   if (!customerId) return res.status(400).json({ ok: false, error: "Missing customerId" });
   if (!itemcodes.length) return res.status(400).json({ ok: false, error: "Missing itemcodes[]" });
 
