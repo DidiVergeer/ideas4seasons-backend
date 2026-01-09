@@ -1498,7 +1498,7 @@ app.post("/prices/resolve", async (req, res) => {
 
     // 2) Debiteur override regels (alle items voor die debiteur)
     const encodedDeb = encodeURIComponent(customerId);
-    const debExtraQuery = `&filterfieldids=Debiteur&filtervalues=${encodedDeb}`;
+    const debExtraQuery = `&filterfieldids=Debiteur_nummer&filtervalues=${encodedDeb}`;
     const debRowsAll = await fetchAfasAll("prijs_debiteur_niveau_app", { extraQuery: debExtraQuery, take: 1000 });
 
     const debMap = new Map(); // itemcode -> price
